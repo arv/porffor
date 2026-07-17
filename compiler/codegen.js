@@ -2436,6 +2436,9 @@ const setLocalWithType = (scope, name, isGlobal, decl, tee = false, overrideType
   return tee ? (ref[N_TYPE] === T.f64 ? valNumber(ref) : ref) : undefined;
 };
 
+// accessor funcs get "get "/"set " prepended to their name per spec (eg `get foo`)
+const accessorFuncName = (kind, base) => kind === 'get' || kind === 'set' ? `${kind} ${base}` : base;
+
 const setDefaultFuncName = (decl, name) => {
   if (decl.id) return;
 
@@ -3986,7 +3989,7 @@ const generateObject = (scope, decl) => {
 
       // todo: support computed names properly
       if (typeof key.value === 'string' && !id) {
-        id = { type: 'Identifier', name: key.value };
+        id = { type: 'Identifier', name: accessorFuncName(kind, key.value) };
         noFuncIndex = true;
       }
 
@@ -4347,7 +4350,7 @@ const generateClass = (scope, decl) => {
       const closureSource = value;
       let id = value.id;
       let noFuncIndex = false;
-      if (typeof key.value === 'string' && !id) { id = { type: 'Identifier', name: key.value }; noFuncIndex = true; }
+      if (typeof key.value === 'string' && !id) { id = { type: 'Identifier', name: accessorFuncName(kind, key.value) }; noFuncIndex = true; }
       value = { ...value, id, _noFuncIndex: noFuncIndex, strict: true, _noGlobalThis: true,
         _closureSource: closureSource._closureSource ?? closureSource };
     }
