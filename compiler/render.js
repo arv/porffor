@@ -309,7 +309,12 @@ export default ({ funcs, data = [], globals = [], entry = null, prefs = {}, used
       if (!f) { fnNameOff.push(0); continue; }
       let name = f.jsName ?? f.name;
       if (name.startsWith('#')) name = '';
-      if (name.startsWith('__')) name = name.split('_').pop();
+      if (name.startsWith('__')) {
+        name = name.split('_').pop();
+        // builtin accessor funcs (foo$get / foo$set) get "get "/"set " prepended per spec
+        if (name.endsWith('$get')) name = 'get ' + name.slice(0, -4);
+        else if (name.endsWith('$set')) name = 'set ' + name.slice(0, -4);
+      }
       if (name.length === 0) { fnNameOff.push(0); continue; }
       const bytes = [ name.length & 0xff, (name.length >>> 8) & 0xff, (name.length >>> 16) & 0xff, (name.length >>> 24) & 0xff ];
       for (let k = 0; k < name.length; k++) bytes.push(name.charCodeAt(k) & 0xff);
