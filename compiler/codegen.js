@@ -4122,7 +4122,6 @@ const resolveMemberDemands = scope => {
       }
 
       const t = TYPES[tn.toLowerCase()] ?? TYPES['__' + tn.toLowerCase()];
-      // bytestrings get ByteString impls here, which fill String.prototype slots (see stringProtoImpl)
       if (t == null || !usesAnyType([ t, primObjAlias[t] ]) || !protoNeeded(t)) continue;
       includeBuiltin(scope, x);
       if (!getterOnly) {
