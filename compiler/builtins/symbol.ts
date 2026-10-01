@@ -65,8 +65,6 @@ export const __Symbol_prototype_toString = function (this: Symbol) {
   return out;
 };
 
-export const __Symbol_prototype_toLocaleString = function (this: Symbol) { return Porffor.callThis(__Symbol_prototype_toString, this); };
-
 export const __Symbol_prototype_valueOf = function (this: Symbol) {
   return this;
 };
