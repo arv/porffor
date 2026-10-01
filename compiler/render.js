@@ -2735,6 +2735,7 @@ static int porf_gc_should_rescan_marked_body(i32 body, i32 type) {
     case ${TYPES.__porffor_asyncgenerator}:
     case ${TYPES.symbol}:
     case ${TYPES.weakref}:
+    case ${TYPES.__porffor_arrayiterator}:
     case ${TYPES.error}:
     case ${TYPES.aggregateerror}:
     case ${TYPES.typeerror}:
@@ -2847,7 +2848,8 @@ weakmap_seen:
       break;
     }
     case ${TYPES.symbol}:
-    case ${TYPES.weakref}: {
+    case ${TYPES.weakref}:
+    case ${TYPES.__porffor_arrayiterator}: { // [[IteratedObject]] jsval at 0
       const jsval v = porf_unpack(*(jsbits*)(MEM + body));
       porf_gc_mark_js(v.val, v.type);
       break;
@@ -2951,6 +2953,7 @@ static void porf_gc_mark_js(f64 value, i32 type) {
     case ${TYPES.weakmap}:
     case ${TYPES.weakset}:
     case ${TYPES.weakref}:
+    case ${TYPES.__porffor_arrayiterator}:
     case ${TYPES.error}:
     case ${TYPES.aggregateerror}:
     case ${TYPES.typeerror}:

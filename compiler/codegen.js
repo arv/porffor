@@ -9,7 +9,7 @@ import {
   Alloc, GcBarrier, ArrGet, ArrSet, ArrLenSet, LenGet, LenSet, RawC, FuncIdx, FuncRec
 } from './ir.js';
 import { BuiltinFuncs, BuiltinVars, fullPrototypes } from './builtins.js';
-import { TYPES, TYPE_FLAGS, TYPE_NAMES } from './types.js';
+import { TYPES, TYPE_FLAGS, TYPE_NAMES, porfforTypeId } from './types.js';
 import semantic, { knownValue, unknownValue } from './semantic.js';
 import parse from './parse.js';
 import temporalPolyfillSource from './temporal.js';
@@ -793,7 +793,7 @@ const lookup = (scope, name, allowImplicitArguments = true, markFunctionReferenc
   if (hoisted) return hoisted;
 
   // Porffor.TYPES.x folds to its id
-  if (name.startsWith('__Porffor_TYPES_')) return Const(T.i32, TYPES[name.slice(16)]);
+  if (name.startsWith('__Porffor_TYPES_')) return Const(T.i32, porfforTypeId(name));
 
   // builtin value globals like Number.MAX_VALUE
   if (name in builtinVars) {
@@ -3663,7 +3663,7 @@ const generateSwitch = (scope, decl) => {
       let type;
       if (!x.test) type = 'default';
       else if (x.test.type === 'Literal') type = x.test.value;
-      else if (x.test.type === 'Identifier' && x.test.name.startsWith('__Porffor_TYPES_')) type = TYPES[x.test.name.slice('__Porffor_TYPES_'.length)];
+      else if (x.test.type === 'Identifier' && x.test.name.startsWith('__Porffor_TYPES_')) type = porfforTypeId(x.test.name);
       if (type !== undefined) cases.push([ type, x.consequent ]);
       else { canTypeCheck = false; break; }
     }

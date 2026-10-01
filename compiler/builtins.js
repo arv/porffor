@@ -1,5 +1,5 @@
 import * as PrecompiledBuiltins from './builtins_precompiled.js';
-import { TYPES, TYPE_NAMES } from './types.js';
+import { TYPES, TYPE_NAMES, porfforTypeId } from './types.js';
 import { Bin, Un, T, K, Const, JvConst, Box, JvType, JvNum, JvPtr, Convert, Reinterpret, CONVERT_SIGNED, N_KIND, N_TYPE, N_A, N_B, Local, Assign, Call, CallDynamic, If, TypeSwitch, Return, RawC, BlockStmt } from './ir.js';
 import './prefs.js';
 
@@ -859,7 +859,7 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
   comptime('__Porffor_as', undefined, (scope, decl, { generate }) => {
     const typeArg = decl.arguments[1];
     if (typeArg?.type === 'Identifier' && typeArg.name.startsWith('__Porffor_TYPES_')) {
-      return Box(generate(scope, decl.arguments[0]), Const(T.i32, TYPES[typeArg.name.slice('__Porffor_TYPES_'.length)]));
+      return Box(generate(scope, decl.arguments[0]), Const(T.i32, porfforTypeId(typeArg.name)));
     }
 
     return Box(generate(scope, decl.arguments[0]), generate(scope, typeArg));
