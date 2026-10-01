@@ -33,7 +33,9 @@ const compile = async (file, _funcs) => {
     if (node.type !== 'ExportNamedDeclaration') continue;
     if (node.declaration?.type !== 'VariableDeclaration') continue;
     for (const decl of node.declaration.declarations) {
-      if (decl.id?.type === 'Identifier') consts[decl.id.name] = decl.init.value;
+      if (decl.id?.type !== 'Identifier') continue;
+      if (decl.init?.type === 'Literal' && typeof decl.init.value === 'string') consts[decl.id.name] = decl.init.value;
+      else if (decl.init?.type === 'Identifier') consts[decl.id.name] = {alias: decl.init.name};
     }
   }
 
@@ -546,7 +548,7 @@ export const BuiltinFuncs = x => {
     });
   }
 }
-export const BuiltinConsts = ${JSON.stringify(consts)};`;
+export const BuiltinConsts = ${JSON.stringify(consts, null, 2)};`;
 };
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -1207,6 +1207,8 @@ export const __Array_prototype_entries = function (this: any[]) {
   return __Porffor_ArrayIterator_create(this, 2);
 };
 
+export const __Array_prototype_$$iterator = __Array_prototype_values;
+
 export const __Porffor_array_fastPush = (arr: any[], el: any): i32 => {
   let len: i32 = arr.length;
   arr[len] = el;

@@ -259,12 +259,23 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     return builtinFuncKeys.filter(x => x.startsWith(prefix)).map(x => x.slice(prefix.length)).filter(x => !x.startsWith('prototype_'));
   };
 
+  const aliasValue = target => {
+    const value = (_scope, { funcRefPtr }) => Box(funcRefPtr(target), Const(T.i32, TYPES.function));
+    value.type = TYPES.function;
+    return value;
+  };
+
   const autoSymbolConsts = name => {
     const prefix = makePrefix(name) + '$$';
     const out = {};
     for (const x in builtinConsts) {
       if (x.startsWith(prefix)) {
-        out[x.slice(prefix.length - 2)] = { value: builtinConsts[x], writable: false, enumerable: false, configurable: true };
+        const c = builtinConsts[x];
+        if (c.alias !== undefined) {
+          out[x.slice(prefix.length - 2)] = { value: aliasValue(c.alias), writable: true, enumerable: false, configurable: true };
+        } else {
+          out[x.slice(prefix.length - 2)] = { value: c, writable: false, enumerable: false, configurable: true };
+        }
       }
     }
     return out;

@@ -188,4 +188,24 @@ export const BuiltinFuncs = x => {
     });
   }
 }
-export const BuiltinConsts = {"__ArrayBuffer_prototype_$$toStringTag":"ArrayBuffer","__SharedArrayBuffer_prototype_$$toStringTag":"SharedArrayBuffer","__Porffor_ArrayIterator_prototype_$$toStringTag":"Array Iterator","__Atomics_$$toStringTag":"Atomics","__BigInt_prototype_$$toStringTag":"BigInt","__DataView_prototype_$$toStringTag":"DataView","__JSON_$$toStringTag":"JSON","__Map_prototype_$$toStringTag":"Map","__Math_$$toStringTag":"Math","__Promise_prototype_$$toStringTag":"Promise","__Reflect_$$toStringTag":"Reflect","__Set_prototype_$$toStringTag":"Set","__Symbol_prototype_$$toStringTag":"Symbol","__WeakMap_prototype_$$toStringTag":"WeakMap","__WeakRef_prototype_$$toStringTag":"WeakRef","__WeakSet_prototype_$$toStringTag":"WeakSet"};
+export const BuiltinConsts = {
+  "__Array_prototype_$$iterator": {
+    "alias": "__Array_prototype_values"
+  },
+  "__ArrayBuffer_prototype_$$toStringTag": "ArrayBuffer",
+  "__SharedArrayBuffer_prototype_$$toStringTag": "SharedArrayBuffer",
+  "__Porffor_ArrayIterator_prototype_$$toStringTag": "Array Iterator",
+  "__Atomics_$$toStringTag": "Atomics",
+  "__BigInt_prototype_$$toStringTag": "BigInt",
+  "__DataView_prototype_$$toStringTag": "DataView",
+  "__JSON_$$toStringTag": "JSON",
+  "__Map_prototype_$$toStringTag": "Map",
+  "__Math_$$toStringTag": "Math",
+  "__Promise_prototype_$$toStringTag": "Promise",
+  "__Reflect_$$toStringTag": "Reflect",
+  "__Set_prototype_$$toStringTag": "Set",
+  "__Symbol_prototype_$$toStringTag": "Symbol",
+  "__WeakMap_prototype_$$toStringTag": "WeakMap",
+  "__WeakRef_prototype_$$toStringTag": "WeakRef",
+  "__WeakSet_prototype_$$toStringTag": "WeakSet"
+};
