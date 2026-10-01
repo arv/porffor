@@ -691,7 +691,15 @@ export const __Object_prototype_toString = function (this: any) {
   return `[object ${tag}]`;
 };
 
-export const __Object_prototype_toLocaleString = function (this: any) { return Porffor.callThis(__Object_prototype_toString, this); };
+// 20.1.3.5 Object.prototype.toLocaleString ( [ reserved1 [ , reserved2 ] ] )
+// https://tc39.es/ecma262/#sec-object.prototype.tolocalestring
+export const __Object_prototype_toLocaleString = function (this: any) {
+  // 1. Let O be the this value.
+  // 2. Return ? Invoke(O, "toString").
+  const toString: any = Porffor.object.get(this, 'toString');
+  if (Porffor.type(toString) != Porffor.TYPES.function) throw new TypeError('toString is not a function');
+  return toString.call(this);
+};
 
 export const __Object_prototype_valueOf = function (this: any) {
   // todo: ToObject
