@@ -31,6 +31,8 @@ export const BuiltinVars = ({ builtinFuncs }) => {
   // builtin objects
   const makePrefix = name => (name.startsWith('__') ? '' : '__') + name + '_';
 
+  const alwaysProtoFuncs = new Set([ '__Object_prototype_toString', '__Object_prototype_valueOf' ]);
+
   const done = new Set();
   const object = (name, props) => {
     done.add(name);
@@ -101,9 +103,17 @@ export const BuiltinVars = ({ builtinFuncs }) => {
         const symbolKeysObservable = () =>
           hasFunc('__Porffor_symbol_wellKnown') || hasFunc('__Reflect_ownKeys') || hasFunc('__Object_getOwnPropertySymbols');
 
+        // bytestrings use String.prototype, so if only the ByteString impl of a String method is
+        // included use it for the slot instead of pulling in the (UTF-16) string one
+        const stringProtoImpl = key => {
+          if (!key.startsWith('__String_prototype_') || hasFunc(key)) return key;
+          const byteKey = '__ByteString_prototype_' + key.slice('__String_prototype_'.length);
+          return hasFunc(byteKey) ? byteKey : key;
+        };
+
         const emitProp = (out, x, d) => {
           const key = prefix + x;
-          const value = propValue(key, d);
+          const value = propValue(stringProtoImpl(key), d);
 
           if (x === '__proto__') {
             includeBuiltin('__Porffor_object_setPrototype');
@@ -146,8 +156,8 @@ export const BuiltinVars = ({ builtinFuncs }) => {
               const key = prefix + x;
               if (lazyKind === 'proto') {
                 if (key in builtinFuncs) {
-                  if (fullPrototypes.has(getName)) includeBuiltin(key);
-                    else if (!hasFunc(key)) continue;
+                  if (fullPrototypes.has(getName) || alwaysProtoFuncs.has(key)) includeBuiltin(key);
+                    else if (!hasFunc(stringProtoImpl(key))) continue;
                 }
                 if (x === 'constructor') {
                   if (fullPrototypes.has(getName)) includeBuiltin(ctorName);
@@ -331,7 +341,11 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     writable: false,
     enumerable: false,
     configurable: false
-  }, Object.fromEntries(wellKnownSymbols.map(x => [x, (_scope, ctx) => wellKnownSymbol(x, ctx)])));
+  }, Object.fromEntries(wellKnownSymbols.map(x => [x, (_scope, ctx) => {
+    // user code can now see a symbol, the included Symbol marks symbols observable (see codegen symbolsObservable)
+    if (!globalThis.precompile) ctx.includeBuiltin('Symbol');
+    return wellKnownSymbol(x, ctx);
+  }])));
 
   for (const x of wellKnownSymbols) {
     wellKnownSymbolProps[x].value.type = TYPES.symbol;

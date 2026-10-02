@@ -20,8 +20,6 @@ export const __Function_prototype_toString = function (this: Function) {
   return out;
 };
 
-export const __Function_prototype_toLocaleString = function (this: Function) { return Porffor.callThis(__Function_prototype_toString, this); };
-
 export const __Function_prototype_apply = function (this: Function, thisArg: any, argsArray: any) {
   return Porffor.call(this, Array.from(argsArray ?? []) as any[], thisArg, null);
 };

@@ -4093,7 +4093,24 @@ const primObjAlias = {
   [TYPES.bytestring]: TYPES.stringobject
 };
 
+const protoTypesFor = t => t === TYPES.string ? [ t, TYPES.bytestring, primObjAlias[t] ] : [ t, primObjAlias[t] ];
+
+// symbols used only internally as property keys (eg @@toStringTag) never reach user code,
+// so Symbol.prototype is only needed once user code can get a symbol
+const symbolsObservable = () => funcIndex['Symbol'] != null || funcIndex['__Reflect_ownKeys'] != null || funcIndex['__Object_getOwnPropertySymbols'] != null;
+const protoNeeded = t => t !== TYPES.symbol || symbolsObservable();
+
+const builtinMemberDemands = {
+  __ecma262_ToPrimitive_Number: [ 'valueOf', 'toString' ],
+  __ecma262_ToPrimitive_String: [ 'toString', 'valueOf' ],
+  __Object_prototype_toLocaleString: [ 'toString' ]
+};
+
 const resolveMemberDemands = scope => {
+  for (const name in builtinMemberDemands) {
+    if (funcIndex[name] != null) for (const x of builtinMemberDemands[name]) memberDemands.add(x);
+  }
+
   for (const propName of memberDemands) {
     const getterOnly = propName === 'constructor';
     for (const x of getterOnly ? builtinPrototypeObjectGetters.values() : (builtinPrototypeFuncs.get(propName) ?? [])) {
@@ -4105,7 +4122,7 @@ const resolveMemberDemands = scope => {
       }
 
       const t = TYPES[tn.toLowerCase()] ?? TYPES['__' + tn.toLowerCase()];
-      if (t == null || !usesAnyType([ t, primObjAlias[t] ])) continue;
+      if (t == null || !usesAnyType([ t, primObjAlias[t] ]) || !protoNeeded(t)) continue;
       includeBuiltin(scope, x);
       if (!getterOnly) {
         const getter = '#get___' + tn + '_prototype';
@@ -4117,16 +4134,7 @@ const resolveMemberDemands = scope => {
   if (funcIndex['__Porffor_object_getHiddenPrototype'] != null) {
     for (const [ tn, getter ] of builtinPrototypeObjectGetters) {
       const t = TYPES[tn.toLowerCase()] ?? TYPES['__' + tn.toLowerCase()];
-      if (
-        t != null &&
-        usesAnyType(
-          t === TYPES.string
-            ? [ t, TYPES.bytestring, primObjAlias[t] ]
-            : [ t, primObjAlias[t] ],
-        )
-      ) {
-        includeBuiltin(scope, getter);
-      }
+      if (t != null && usesAnyType(protoTypesFor(t)) && protoNeeded(t)) includeBuiltin(scope, getter);
     }
   }
 };

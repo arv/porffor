@@ -1962,9 +1962,6 @@ export const __ByteString_prototype_toString = function (this: bytestring) {
   return this;
 };
 
-export const __String_prototype_toLocaleString = function (this: string) { return Porffor.callThis(__String_prototype_toString, this); };
-export const __ByteString_prototype_toLocaleString = function (this: bytestring) { return Porffor.callThis(__ByteString_prototype_toString, this); };
-
 // 22.1.3.35 String.prototype.valueOf ()
 // https://tc39.es/ecma262/#sec-string.prototype.valueof
 export const __String_prototype_valueOf = function (this: string) {
