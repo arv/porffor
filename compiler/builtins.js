@@ -1,5 +1,5 @@
 import * as PrecompiledBuiltins from './builtins_precompiled.js';
-import { TYPES, TYPE_NAMES } from './types.js';
+import { TYPES, TYPE_NAMES, porfforTypeId } from './types.js';
 import { Bin, Un, T, K, Const, JvConst, Box, JvType, JvNum, JvPtr, Convert, Reinterpret, CONVERT_SIGNED, N_KIND, N_TYPE, N_A, N_B, Local, Assign, Call, CallDynamic, If, TypeSwitch, Return, RawC, BlockStmt } from './ir.js';
 import './prefs.js';
 
@@ -259,12 +259,23 @@ export const BuiltinVars = ({ builtinFuncs }) => {
     return builtinFuncKeys.filter(x => x.startsWith(prefix)).map(x => x.slice(prefix.length)).filter(x => !x.startsWith('prototype_'));
   };
 
+  const aliasValue = target => {
+    const value = (_scope, { funcRefPtr }) => Box(funcRefPtr(target), Const(T.i32, TYPES.function));
+    value.type = TYPES.function;
+    return value;
+  };
+
   const autoSymbolConsts = name => {
     const prefix = makePrefix(name) + '$$';
     const out = {};
     for (const x in builtinConsts) {
       if (x.startsWith(prefix)) {
-        out[x.slice(prefix.length - 2)] = { value: builtinConsts[x], writable: false, enumerable: false, configurable: true };
+        const c = builtinConsts[x];
+        if (c.alias !== undefined) {
+          out[x.slice(prefix.length - 2)] = { value: aliasValue(c.alias), writable: true, enumerable: false, configurable: true };
+        } else {
+          out[x.slice(prefix.length - 2)] = { value: c, writable: false, enumerable: false, configurable: true };
+        }
       }
     }
     return out;
@@ -859,7 +870,7 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
   comptime('__Porffor_as', undefined, (scope, decl, { generate }) => {
     const typeArg = decl.arguments[1];
     if (typeArg?.type === 'Identifier' && typeArg.name.startsWith('__Porffor_TYPES_')) {
-      return Box(generate(scope, decl.arguments[0]), Const(T.i32, TYPES[typeArg.name.slice('__Porffor_TYPES_'.length)]));
+      return Box(generate(scope, decl.arguments[0]), Const(T.i32, porfforTypeId(typeArg.name)));
     }
 
     return Box(generate(scope, decl.arguments[0]), generate(scope, typeArg));

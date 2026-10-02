@@ -66,6 +66,14 @@ registerInternalType('StringObject');
 registerInternalType('__Porffor_ClosureEnv');
 registerInternalType('__Porffor_Generator');
 registerInternalType('__Porffor_AsyncGenerator');
+registerInternalType('__Porffor_ArrayIterator');
 
 for (const x of [ '', 'Aggregate', 'Type', 'Reference', 'Syntax', 'Range', 'Eval', 'URI' ])
   registerInternalType(`${x}Error`);
+
+// Porffor.TYPES.x (as __Porffor_TYPES_x) -> its id, an unknown x is a builtin bug so fail loudly
+export const porfforTypeId = name => {
+  const t = TYPES[name.slice('__Porffor_TYPES_'.length)];
+  if (t == null) throw new Error(`unknown type Porffor.TYPES.${name.slice('__Porffor_TYPES_'.length)}`);
+  return t;
+};
