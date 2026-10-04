@@ -3999,6 +3999,8 @@ const generateArray = (scope, decl, name = '$undeclared', staticAlloc = false) =
   if (isStatic) {
     const uniqueName = name === '$undeclared' ? name + uniqId(scope) : name;
     pointer = dataRef(unitOf(scope), `#staticarr:${uniqueName}`, new Array(allocSize).fill(0));
+    // mutable scratch: threaded builds give each call its own copy
+    pointer[N_B] = 1;
   } else {
     pointer = reuse(scope, Alloc(Const(T.i32, allocSize), TYPES.array));
   }

@@ -69,3 +69,6 @@ registerInternalType('__Porffor_AsyncGenerator');
 
 for (const x of [ '', 'Aggregate', 'Type', 'Reference', 'Syntax', 'Range', 'Eval', 'URI' ])
   registerInternalType(`${x}Error`);
+
+// registered last so existing type ids (baked into precompiled builtins) stay put
+registerInternalType('Thread');

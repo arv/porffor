@@ -333,6 +333,15 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     if (needsCoro(f)) usesCoro = true;
     if (isSyncAsync(f)) usesSyncAsync = true;
   }
+
+  // Thread pulls in its entry point: everything per thread then goes through porf_ts
+  const threadRunFunc = funcByName.get('__Porffor_thread_run');
+  const usesThreads = !!threadRunFunc?.body;
+  if (usesThreads) {
+    if (!gcEnabled) throw new Error('porffor: Thread requires the gc (drop --no-gc)');
+    if (split) throw new Error('porffor: Thread is not supported with multi-unit (module) builds yet');
+    if (prefs.nativeFetch) throw new Error('porffor: Thread is not supported with native fetch yet');
+  }
   const promiseResolveFunc = funcByName.get('__Porffor_promise_resolve');
   const settleAsyncResult = promiseResolveFunc
     ? (value, promise) => `(void)${fnSym(promiseResolveFunc)}(${value}, ${promise});`
@@ -437,6 +446,21 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     return node.some(hasAlloc);
   };
 
+  const scratchIds = (node, out = new Set()) => {
+    if (!Array.isArray(node)) return out;
+    if (isNode(node)) {
+      if (node[N_KIND] === K.DataRef && node[N_B] === 1) out.add(node[N_A]);
+      scratchIds(node[N_A], out);
+      scratchIds(node[N_B], out);
+      scratchIds(node[N_C], out);
+    } else for (let i = 0; i < node.length; i++) scratchIds(node[i], out);
+    return out;
+  };
+  const emitScratchSlots = body => {
+    if (!usesThreads) return;
+    for (const id of scratchIds(body)) emit(`  PORF_ROOT u32 porf_sa${id} = 0;\n`);
+  };
+
   // builtins keep raw allocations in i32 locals: those must be gc-visible too
   const allocLocals = (node, out = new Set()) => {
     if (!Array.isArray(node)) return out;
@@ -469,6 +493,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
 
       case K.DataRef: {
         const id = node[N_A];
+        // a builtin's static array literal is shared scratch: give each call its own
+        if (usesThreads && node[N_B] === 1) return [`porf_scratch_arr(&porf_sa${id}, ${(data[id].length - 16) >> 3})`, P_POSTFIX];
         if (!split) return [`${dataOffsets[id]}u`, P_PRIM];
         const u = dataUnits[id];
         cur.dbases[u] = true;
@@ -735,6 +761,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         breakStack.push(label);
         if (label) labelTry.set(label, activeTryDepth);
         depth++;
+        if (usesThreads) emit(`${ind()}PORF_SAFEPOINT();\n`);
         renderStmts(stmts);
         if (region) coro.path.pop();
         if (label && usedLabels.has(label + '_c')) emit(`${ind()}${sanitize(label)}_c:;\n`);
@@ -1335,6 +1362,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     loopStack.length = 0;
     usedLabels = new Set();
     for (const [n, t] of locals) emit(`  ${CT[t]} ${n}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
+    emitScratchSlots(body);
 
     const { pre, args } = invokeArgs(f, { env: 'porf_fr->env', thisv: 'porf_fr->thisv', newtv: 'porf_fr->newtv', callee: 'porf_fr->callee', argc: 'porf_fr->argc', argv: 'porf_coro_argv(porf_fr)',
       arg: j => `porf_unpack(porf_fr->argc > ${j} ? porf_coro_argv(porf_fr)[${j}] : JV_UNDEFINED_BITS)` });
@@ -1382,6 +1410,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       const q = allocd.has(name) && (t === T.i32 || t === T.u32) ? 'PORF_ROOT ' : rootQual(t);
       emit(`  ${q}${CT[t]} ${sanitize(name)}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
     }
+    emitScratchSlots(f.body);
     renderStmts(f.body);
     emit(`}\n\n`);
   };
@@ -1396,8 +1425,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   const iterClose = funcs.find(x => x && x.name === '__Porffor_iterator_close' && x.body);
   if (iterClose) runtimeRefs.push(iterClose);
   if (promiseResolveFunc) runtimeRefs.push(promiseResolveFunc);
-  prelude.push(RUNTIME_HEAD(prefs, toStr ? fnSym(toStr) : null, iterClose ? fnSym(iterClose) : null));
-  if (usesCoro) prelude.push(CORO_RUNTIME());
+  prelude.push(RUNTIME_HEAD(prefs, toStr ? fnSym(toStr) : null, iterClose ? fnSym(iterClose) : null, usesThreads));
+  if (usesCoro) prelude.push(CORO_RUNTIME(usesThreads));
 
   // link unit head: static data image, globals, gc roots, per-function tables
   const link = [];
@@ -2136,8 +2165,16 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
 `);
   }
 
+  if (usesThreads) {
+    const runParam = threadRunFunc.params[0];
+    const runCall = obj => `${fnSym(threadRunFunc)}(${runParam.type === T.jsval ? `porf_box((f64)${obj}, ${TYPES.thread})` : obj})`;
+    const runJobs = funcByName.get('__Porffor_promise_runJobs');
+    const runJobsCall = runJobs?.body ? `(void)${fnSym(runJobs)}(${runJobs.params.length === 0 ? '' : 'JV_UNDEFINED, JV_UNDEFINED'})` : null;
+    emit(THREAD_RUNTIME(runCall, runJobsCall, prefs));
+  }
+
   if (entry && !prefs.nativeFetch) {
-    emit(`int main(int argc, char** argv) {\n  porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n  return 0;\n}\n`);
+    emit(`int main(int argc, char** argv) {\n  porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n  ${usesThreads ? 'porf_threads_finish();\n  ' : ''}return 0;\n}\n`);
   }
 
   if (usesMath) prelude.splice(1, 0, '#include <math.h>\n');
@@ -2163,7 +2200,7 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
     const text = prelude.concat(link);
     for (const u of unitOrder) if (unitParts[u]) text.push(unitText(u, unitParts[u]));
     const c = text.join('');
-    if (!prefs.nativeFetch) return c;
+    if (!prefs.nativeFetch) return usesThreads ? { c, threads: true } : c;
     return { c, nativeFetch: true };
   }
 
@@ -2317,7 +2354,7 @@ ${st}void porf_gc_collect(int minor) { (void)minor; }
 `;
 };
 
-const PORF_GC_ALLOC = prefs => {
+const PORF_GC_ALLOC = (prefs, threads = false) => {
   const st = 'static ';
   const sti = 'static inline ';
 
@@ -2410,7 +2447,10 @@ static u32 porf_gc_free_page_count = 0;
 #define porf_gc_bit_clear(plane, g) (porf_gc_meta[porf_gc_widx(g) + (plane)] &= ~(1ull << ((g) & 63u)))
 
 struct porf_gc_window { u32 cur, end, lo; };
-static struct porf_gc_window porf_gc_active[PORF_GC_NCLASSES];
+${threads ? `// each thread allocates from its own windows (porf_gc_active is per thread)
+static struct porf_gc_window porf_main_gc_active[PORF_GC_NCLASSES];
+static porf_tstate porf_main_ts = { .gc_active = porf_main_gc_active, .exception = {0.0, ${TYPES.undefined}}, .iter_open = {0.0, ${TYPES.undefined}} };
+` : 'static struct porf_gc_window porf_gc_active[PORF_GC_NCLASSES];\n'}\
 static u32 porf_gc_partial[PORF_GC_NCLASSES];
 
 static u64 porf_gc_allocation_debt = 0;
@@ -2723,7 +2763,7 @@ static int porf_gc_install_run(i32 ci, u32 pg) {
   m->cursor = (u16)j;
   w->lo = w->cur = base_addr + i * cls;
   w->end = base_addr + j * cls;
-  porf_gc_window_bytes += (i64)((j - i) * cls);
+  ${threads ? '__atomic_fetch_add(&porf_gc_window_bytes, (i64)((j - i) * cls), __ATOMIC_RELAXED);' : 'porf_gc_window_bytes += (i64)((j - i) * cls);'}
   porf_gc_touch_list(pg);
   return 1;
 }
@@ -2778,13 +2818,14 @@ static int porf_gc_refill_window(i32 ci) {
   }
   w->lo = w->cur = pg << PORF_GC_SPAGE_SHIFT;
   w->end = (pg << PORF_GC_SPAGE_SHIFT) + (u32)porf_gc_cls_slots[ci] * porf_gc_cls_size[ci];
-  porf_gc_window_bytes += (i64)(w->end - w->cur);
+  ${threads ? '__atomic_fetch_add(&porf_gc_window_bytes, (i64)(w->end - w->cur), __ATOMIC_RELAXED);' : 'porf_gc_window_bytes += (i64)(w->end - w->cur);'}
   porf_gc_touch_list(pg);
   return 1;
 }
 
 ${st}u32 porf_alloc_slow(u32 bytes, u32 typeId);
 ${sti}u32 porf_alloc(u32 bytes, u32 typeId) {
+${threads ? '  PORF_SAFEPOINT();\n' : ''}\
   if (bytes <= PORF_GC_MAX_SMALL) {
     const u32 ci = porf_gc_cls_lut[(bytes + 7u) >> 3];
     struct porf_gc_window* w = &porf_gc_active[ci];
@@ -2801,12 +2842,40 @@ ${sti}u32 porf_alloc(u32 bytes, u32 typeId) {
 
 static void porf_gc_minor(void);
 
+${threads ? `// the allocator's shared state (pages, partial runs, budgets) is guarded by the gc lock
+// every running thread fills its own nursery share between minor collections
+#define PORF_GC_NURSERY_LIMIT ((i64)PORF_GC_NURSERY_BYTES * __atomic_load_n(&porf_threads_n, __ATOMIC_RELAXED))
+static u32 porf_alloc_slow_locked(u32 bytes, u32 typeId);
 ${st}u32 porf_alloc_slow(u32 bytes, u32 typeId) {
+  // the next free run in the page this thread's window already owns needs no lock:
+  // only this thread touches that page's cursor and alloc bits until the next collection
+  if (bytes <= PORF_GC_MAX_SMALL && porf_heap_base != 0${minorsEnabled ? ' && __atomic_load_n(&porf_gc_window_bytes, __ATOMIC_RELAXED) < PORF_GC_NURSERY_LIMIT' : ''}) {
+    const u32 ci = porf_gc_cls_lut[(bytes + 7u) >> 3];
+    struct porf_gc_window* w = &porf_gc_active[ci];
+    if (w->end != 0) {
+      const u32 pg = porf_gc_chunk_start((w->end - 1u) >> PORF_GC_SPAGE_SHIFT) >> PORF_GC_SPAGE_SHIFT;
+      porf_gc_publish_window((i32)ci);
+      w->cur = w->end = w->lo = 0;
+      if (porf_gc_install_run((i32)ci, pg)) return porf_alloc(bytes, typeId);
+    }
+  }
+  porf_gc_lock_acquire();
+  const u32 out = porf_alloc_slow_locked(bytes, typeId);
+  porf_gc_lock_release();
+  return out;
+}
+
+static u32 porf_alloc_slow_locked(u32 bytes, u32 typeId) {` : `${st}u32 porf_alloc_slow(u32 bytes, u32 typeId) {`}
   if (porf_heap_base == 0) {
     porf_arena_init();
     return porf_alloc_slow(bytes, typeId);
   }
-${minorsEnabled ? `  if (porf_gc_window_bytes >= (i64)PORF_GC_NURSERY_BYTES || porf_gc_span_bytes >= 8388608ll) {
+${minorsEnabled ? threads ? `  if (__atomic_load_n(&porf_gc_window_bytes, __ATOMIC_RELAXED) >= PORF_GC_NURSERY_LIMIT || porf_gc_span_bytes >= 8388608ll * __atomic_load_n(&porf_threads_n, __ATOMIC_RELAXED)) {
+    __atomic_store_n(&porf_gc_window_bytes, 0, __ATOMIC_RELAXED);
+    porf_gc_span_bytes = 0;
+    porf_gc_minor();
+  }
+` : `  if (porf_gc_window_bytes >= (i64)PORF_GC_NURSERY_BYTES || porf_gc_span_bytes >= 8388608ll) {
     porf_gc_window_bytes = 0;
     porf_gc_span_bytes = 0;
     porf_gc_minor();
@@ -2872,8 +2941,7 @@ static inline u32 porf_gc_barrier_ptr_i32(i32 p) { return (u32)p; }
 static inline u32 porf_gc_barrier_ptr_jsval(jsval v) { return (u32)v.val; }
 #define porf_gc_barrier(p, type) porf_gc_barrier_impl(_Generic((p), jsval: porf_gc_barrier_ptr_jsval, i32: porf_gc_barrier_ptr_i32, default: porf_gc_barrier_ptr_u32)(p), (type))
 
-static void* porf_c_stack_top = NULL;
-
+${threads ? '' : 'static void* porf_c_stack_top = NULL;\n'}
 ${sti}int porf_gc_type_can_reference(i32 type) {
   switch (type) {
     case ${TYPES.undefined}:
@@ -3238,6 +3306,7 @@ static int porf_gc_should_rescan_marked_body(i32 body, i32 type) {
     case ${TYPES.__porffor_asyncgenerator}:
     case ${TYPES.symbol}:
     case ${TYPES.weakref}:
+${threads ? `    case ${TYPES.thread}:\n` : ''}\
     case ${TYPES.error}:
     case ${TYPES.aggregateerror}:
     case ${TYPES.typeerror}:
@@ -3355,6 +3424,14 @@ weakmap_seen:
       porf_gc_mark_js(v.val, v.type);
       break;
     }
+${threads ? `    case ${TYPES.thread}: {
+      const jsval result = porf_unpack(*(jsbits*)(MEM + body));
+      porf_gc_mark_js(result.val, result.type);
+      const jsval fn = porf_unpack(*(jsbits*)(MEM + body + 8));
+      porf_gc_mark_js(fn.val, fn.type);
+      break;
+    }
+` : ''}\
     case ${TYPES.error}:
     case ${TYPES.aggregateerror}:
     case ${TYPES.typeerror}:
@@ -3460,6 +3537,7 @@ static void porf_gc_mark_js(f64 value, i32 type) {
     case ${TYPES.weakmap}:
     case ${TYPES.weakset}:
     case ${TYPES.weakref}:
+${threads ? `    case ${TYPES.thread}:\n` : ''}\
     case ${TYPES.error}:
     case ${TYPES.aggregateerror}:
     case ${TYPES.typeerror}:
@@ -3778,7 +3856,18 @@ static void porf_gc_cons_scan_range(const u64* lo, const u64* hi) {
   }
 }
 
+${threads ? `// set by the collecting thread: every other thread is parked and scanned from
+// the registers and stack end it saved when it parked
+static porf_tstate* porf_gc_collector = NULL;
+` : ''}\
 static void porf_gc_mark_cons_roots(void) {
+${threads ? `  if (porf_ts != porf_gc_collector) {
+    porf_gc_cons_scan_range((const u64*)&porf_ts->regs, (const u64*)((const char*)&porf_ts->regs + sizeof(porf_ts->regs)));
+    const u64* lo = (const u64*)(((uintptr_t)porf_ts->stack_lo + 7) & ~(uintptr_t)7);
+    const u64* hi = (const u64*)porf_c_stack_top;
+    if (lo < hi) porf_gc_cons_scan_range(lo, hi);
+  } else {
+` : ''}\
   jmp_buf regs;
   if (_setjmp(regs) == 0) {
     porf_gc_cons_scan_range((const u64*)&regs, (const u64*)((const char*)&regs + sizeof(regs)));
@@ -3787,6 +3876,7 @@ static void porf_gc_mark_cons_roots(void) {
   const u64* lo = (const u64*)(((uintptr_t)&anchor + 7) & ~(uintptr_t)7);
   const u64* hi = (const u64*)porf_c_stack_top;
   if (lo < hi) porf_gc_cons_scan_range(lo, hi);
+${threads ? '  }\n' : ''}\
   if (porf_try_depth > 0) {
     porf_gc_cons_scan_range((const u64*)porf_try_data, (const u64*)(porf_try_data + porf_try_depth));
   }
@@ -4068,9 +4158,37 @@ ${st}void porf_gc_collect_idle(void) {
 }
 ` : ''}\
 
+${threads ? `static void porf_gc_collect_impl(int minor);
+
+// stop the world: every other registered thread parks at a safepoint (or is in a
+// blocking region) before the collection runs on this thread
 ${st}void porf_gc_collect(int minor) {
   if (porf_heap_base == 0) return;
-  for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) porf_gc_publish_window(ci);
+  porf_gc_lock_acquire();
+  porf_tstate* self = porf_ts;
+  pthread_mutex_lock(&porf_stw_lock);
+  __atomic_store_n(&porf_stw_requested, 1, __ATOMIC_RELEASE);
+  while (porf_threads_parked < porf_threads_n - 1) pthread_cond_wait(&porf_stw_cond, &porf_stw_lock);
+  pthread_mutex_unlock(&porf_stw_lock);
+  porf_gc_collector = self;
+  porf_gc_collect_impl(minor);
+  porf_gc_collector = NULL;
+  porf_ts = self;
+  pthread_mutex_lock(&porf_stw_lock);
+  __atomic_store_n(&porf_stw_requested, 0, __ATOMIC_RELEASE);
+  pthread_cond_broadcast(&porf_stw_cond);
+  pthread_mutex_unlock(&porf_stw_lock);
+  porf_gc_lock_release();
+}
+
+static void porf_gc_collect_impl(int minor) {
+  for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
+    porf_ts = t;
+    for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) porf_gc_publish_window(ci);
+  }
+  porf_ts = porf_gc_collector;` : `${st}void porf_gc_collect(int minor) {
+  if (porf_heap_base == 0) return;
+  for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) porf_gc_publish_window(ci);`}
   porf_gc_minor_mode = minor;
   if (!minor) {
     porf_gc_claimed_since_full = 0;
@@ -4087,9 +4205,16 @@ ${st}void porf_gc_collect(int minor) {
   porf_gc_weakmaps_len = 0;
   porf_gc_boxed_marks_len = 0;
   porf_gc_mark_native_roots();
-  porf_gc_mark_cons_roots();
+${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
+    porf_ts = t;
+    porf_gc_mark_cons_roots();
+    porf_gc_mark_js(porf_exception.val, porf_exception.type);
+    porf_gc_mark_js(porf_iter_open.val, porf_iter_open.type);
+    if (t->thread_obj != 0) porf_gc_mark_js((f64)t->thread_obj, ${TYPES.thread});
+  }
+  porf_ts = porf_gc_collector;` : `  porf_gc_mark_cons_roots();
   porf_gc_mark_js(porf_exception.val, porf_exception.type);
-  porf_gc_mark_js(porf_iter_open.val, porf_iter_open.type);
+  porf_gc_mark_js(porf_iter_open.val, porf_iter_open.type);`}
   porf_gc_mark_global_roots();
   porf_gc_drain_mark_queue();
   if (minor) porf_gc_scan_cards();
@@ -4143,7 +4268,8 @@ ${st}void porf_gc_collect(int minor) {
     porf_gc_discard_free_runs();
     porf_gc_maybe_trim_memory();
   }
-  memset(porf_gc_active, 0, sizeof(porf_gc_active));
+${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next)
+    memset(t->gc_active, 0, sizeof(struct porf_gc_window) * PORF_GC_NCLASSES);` : '  memset(porf_gc_active, 0, sizeof(porf_gc_active));'}
   porf_gc_minor_mode = 0;
 }
 `;
@@ -4152,7 +4278,253 @@ ${st}void porf_gc_collect(int minor) {
 // jsval encoding: f64 numbers are themselves, else 0xFFF8 (sign + quiet-NaN) << 48 |
 // type:8 << 43 | payload:32. hardware qNaN is 0x7FF8 (sign clear) so never collides,
 // sign-set NaNs from raw bytes are canonicalized at Float64Array/DataView reads (porf_canon)
-const RUNTIME_HEAD = (prefs, toStr = null, iterClose = null) => {
+// shared-memory threads: per-thread runtime state and the stop-the-world protocol.
+// the state lives in plain memory (not TLS) so a collecting thread can reach every
+// other thread's roots through the registry; the old global names become macros
+const THREAD_HEAD = () => `
+#include <pthread.h>
+#include <sched.h>
+
+struct porf_gc_window;
+struct porf_coro_call;
+typedef struct porf_tstate {
+  jmp_buf* try_data;
+  i32 try_cap;
+  i32 try_depth;
+  jsval exception;
+  jsval iter_open;
+  i32 iter_base;
+  u32* job_queue;
+  u32 job_head;
+  u32 job_len;
+  u32 job_cap;
+  void* c_stack_top;
+  struct porf_coro_call* coro_cur;
+  i32 coro_mode;
+  struct porf_gc_window* gc_active;
+  i32 gc_lock_depth;
+  u32 thread_obj;
+  void* stack_lo;
+  jmp_buf regs;
+  struct porf_tstate* next;
+} porf_tstate;
+
+static porf_tstate porf_main_ts;
+static _Thread_local porf_tstate* porf_ts = &porf_main_ts;
+
+#define porf_try_data (porf_ts->try_data)
+#define porf_try_cap (porf_ts->try_cap)
+#define porf_try_depth (porf_ts->try_depth)
+#define porf_exception (porf_ts->exception)
+#define porf_iter_open (porf_ts->iter_open)
+#define porf_iter_base (porf_ts->iter_base)
+#define porf_promise_job_queue (porf_ts->job_queue)
+#define porf_promise_job_head (porf_ts->job_head)
+#define porf_promise_job_len (porf_ts->job_len)
+#define porf_promise_job_cap (porf_ts->job_cap)
+#define porf_c_stack_top (porf_ts->c_stack_top)
+#define porf_coro_cur (porf_ts->coro_cur)
+#define porf_coro_mode (porf_ts->coro_mode)
+#define porf_gc_active (porf_ts->gc_active)
+
+// registered threads, guarded by porf_stw_lock
+static porf_tstate* porf_threads = &porf_main_ts;
+static i32 porf_threads_n = 1;
+static i32 porf_threads_parked = 0;
+static i32 porf_stw_requested = 0;
+static pthread_mutex_t porf_stw_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t porf_stw_cond = PTHREAD_COND_INITIALIZER;
+
+// save what the collector needs to scan this thread: callee-saved registers and
+// the live end of the stack. the caller must not touch the heap until it resumes
+#define PORF_SAVE_STACK(t) do { volatile u64 porf_anchor_ = 0; (void)_setjmp((t)->regs); (t)->stack_lo = (void*)&porf_anchor_; } while (0)
+
+// a thread stops here while another one collects
+static PORF_NOINLINE void porf_park(void) {
+  porf_tstate* t = porf_ts;
+  PORF_SAVE_STACK(t);
+  pthread_mutex_lock(&porf_stw_lock);
+  porf_threads_parked++;
+  pthread_cond_broadcast(&porf_stw_cond);
+  while (porf_stw_requested) pthread_cond_wait(&porf_stw_cond, &porf_stw_lock);
+  porf_threads_parked--;
+  pthread_mutex_unlock(&porf_stw_lock);
+}
+
+#define PORF_SAFEPOINT() do { if (__builtin_expect(__atomic_load_n(&porf_stw_requested, __ATOMIC_ACQUIRE), 0)) porf_park(); } while (0)
+
+// a thread blocked in a wait counts as parked, so collections need not wait for it.
+// the stack is saved in the caller's frame: enter is a macro, not a call
+#define porf_blocking_enter() do { \\
+  PORF_SAVE_STACK(porf_ts); \\
+  pthread_mutex_lock(&porf_stw_lock); \\
+  porf_threads_parked++; \\
+  pthread_cond_broadcast(&porf_stw_cond); \\
+  pthread_mutex_unlock(&porf_stw_lock); \\
+} while (0)
+
+static void porf_blocking_exit(void) {
+  pthread_mutex_lock(&porf_stw_lock);
+  while (porf_stw_requested) pthread_cond_wait(&porf_stw_cond, &porf_stw_lock);
+  porf_threads_parked--;
+  pthread_mutex_unlock(&porf_stw_lock);
+}
+
+// guards the allocator's shared state and collections. reentrant per thread. a
+// waiter counts as parked: the holder may be collecting and waiting for it to park
+static pthread_mutex_t porf_gc_lock = PTHREAD_MUTEX_INITIALIZER;
+static void porf_gc_lock_acquire(void) {
+  if (porf_ts->gc_lock_depth++ > 0) return;
+  if (pthread_mutex_trylock(&porf_gc_lock) == 0) return;
+  porf_blocking_enter();
+  pthread_mutex_lock(&porf_gc_lock);
+  porf_blocking_exit();
+}
+static void porf_gc_lock_release(void) {
+  if (--porf_ts->gc_lock_depth == 0) pthread_mutex_unlock(&porf_gc_lock);
+}
+
+static i32 porf_thread_spawn(u32 obj);
+static void porf_thread_join(u32 obj);
+static void porf_threads_finish(void);
+`;
+
+const THREAD_RUNTIME = (runCall, runJobsCall, prefs) => {
+  const stackKiB = parseInt(prefs.threadStack) || 0;
+  return `// ---- threads ----
+#ifndef PORF_THREAD_STACK
+#ifdef __wasi__
+#define PORF_THREAD_STACK (${stackKiB || 1024}u * 1024u)
+#else
+#define PORF_THREAD_STACK (${stackKiB || 8192}u * 1024u)
+#endif
+#endif
+
+static pthread_mutex_t porf_thread_done_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t porf_thread_done_cond = PTHREAD_COND_INITIALIZER;
+static i32 porf_threads_live = 0;
+
+#define PORF_THREAD_STATE(obj) ((u8*)(MEM + (obj) + 16))
+
+static void porf_thread_register(porf_tstate* t) {
+  // under the gc lock no collection is in flight, so the list can change
+  porf_gc_lock_acquire();
+  pthread_mutex_lock(&porf_stw_lock);
+  t->next = porf_threads;
+  porf_threads = t;
+  porf_threads_n++;
+  pthread_mutex_unlock(&porf_stw_lock);
+  porf_gc_lock_release();
+}
+
+// caller holds the gc lock
+static void porf_thread_unlink(porf_tstate* t) {
+  pthread_mutex_lock(&porf_stw_lock);
+  for (porf_tstate** p = &porf_threads; *p != NULL; p = &(*p)->next) {
+    if (*p == t) { *p = t->next; break; }
+  }
+  porf_threads_n--;
+  pthread_cond_broadcast(&porf_stw_cond);
+  pthread_mutex_unlock(&porf_stw_lock);
+}
+
+// on the exiting thread itself
+static void porf_thread_unregister(void) {
+  porf_gc_lock_acquire();
+  // objects in this thread's windows only get their alloc bits when published
+  for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) porf_gc_publish_window(ci);
+  porf_thread_unlink(porf_ts);
+  porf_gc_lock_release();
+}
+
+static void porf_thread_free(porf_tstate* t) {
+  free(t->try_data);
+  free(t->job_queue);
+  free(t->gc_active);
+  free(t);
+}
+
+static void* porf_thread_main(void* arg) {
+  porf_tstate* t = (porf_tstate*)arg;
+  porf_ts = t;
+  volatile int porf_stack_anchor = 0;
+  t->c_stack_top = (void*)&porf_stack_anchor;
+  ${runCall('t->thread_obj')};
+${runJobsCall ? `  ${runJobsCall};\n` : ''}\
+  // publish completion while still registered: the Thread object is rooted until unregistering
+  __atomic_store_n(PORF_THREAD_STATE(t->thread_obj), 1, __ATOMIC_RELEASE);
+  porf_thread_unregister();
+  pthread_mutex_lock(&porf_thread_done_lock);
+  porf_threads_live--;
+  pthread_cond_broadcast(&porf_thread_done_cond);
+  pthread_mutex_unlock(&porf_thread_done_lock);
+  porf_thread_free(t);
+  (void)porf_stack_anchor;
+  return NULL;
+}
+
+// start a thread running the Thread object's function. 0 if none could be started
+static i32 porf_thread_spawn(u32 obj) {
+  porf_tstate* t = (porf_tstate*)calloc(1, sizeof(porf_tstate));
+  struct porf_gc_window* w = (struct porf_gc_window*)calloc(PORF_GC_NCLASSES, sizeof(struct porf_gc_window));
+  if (!t || !w) { free(t); free(w); return 0; }
+  t->gc_active = w;
+  t->exception = JV_UNDEFINED;
+  t->iter_open = JV_UNDEFINED;
+  t->thread_obj = obj;
+  porf_thread_register(t);
+
+  pthread_mutex_lock(&porf_thread_done_lock);
+  porf_threads_live++;
+  pthread_mutex_unlock(&porf_thread_done_lock);
+
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, PORF_THREAD_STACK);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  pthread_t th;
+  const int err = pthread_create(&th, &attr, porf_thread_main, t);
+  pthread_attr_destroy(&attr);
+  if (err == 0) return 1;
+
+  // never ran, so it allocated nothing
+  porf_gc_lock_acquire();
+  porf_thread_unlink(t);
+  porf_gc_lock_release();
+  pthread_mutex_lock(&porf_thread_done_lock);
+  porf_threads_live--;
+  pthread_mutex_unlock(&porf_thread_done_lock);
+  porf_thread_free(t);
+  return 0;
+}
+
+static void porf_thread_join(u32 obj) {
+  if (__atomic_load_n(PORF_THREAD_STATE(obj), __ATOMIC_ACQUIRE)) return;
+  porf_blocking_enter();
+  pthread_mutex_lock(&porf_thread_done_lock);
+  while (!__atomic_load_n(PORF_THREAD_STATE(obj), __ATOMIC_ACQUIRE))
+    pthread_cond_wait(&porf_thread_done_cond, &porf_thread_done_lock);
+  pthread_mutex_unlock(&porf_thread_done_lock);
+  porf_blocking_exit();
+}
+
+// the process lives until every thread has finished
+static void porf_threads_finish(void) {
+  pthread_mutex_lock(&porf_thread_done_lock);
+  const i32 live = porf_threads_live;
+  pthread_mutex_unlock(&porf_thread_done_lock);
+  if (live == 0) return;
+  porf_blocking_enter();
+  pthread_mutex_lock(&porf_thread_done_lock);
+  while (porf_threads_live > 0) pthread_cond_wait(&porf_thread_done_cond, &porf_thread_done_lock);
+  pthread_mutex_unlock(&porf_thread_done_lock);
+  porf_blocking_exit();
+}
+
+`;
+};
+
+const RUNTIME_HEAD = (prefs, toStr = null, iterClose = null, threads = false) => {
   const st = 'static ';
   const sti = 'static inline ';
   return `// generated by porffor ${globalThis.version}
@@ -4239,7 +4611,7 @@ ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #endif
 extern const u32 porf_static_end;
 #define PORF_GC_ENABLED ${prefs.gc === false ? 0 : 1}
-
+${threads ? THREAD_HEAD() : ''}
 #define JV_PATTERN 0xFFF8000000000000ull
 #define JV_TYPE_MASK 0x07F8000000000000ull
 #define JV_UNDEFINED_BITS (JV_PATTERN | ((u64)${TYPES.undefined} << 43))
@@ -4299,11 +4671,11 @@ static inline jsval porf_unpack(jsbits b) {
 }
 static inline f64 porf_canon(f64 d) { return d == d ? d : porf_bits_to_f64(0x7FF8000000000000ull); }
 
-static u32* porf_promise_job_queue = NULL;
+${threads ? '' : `static u32* porf_promise_job_queue = NULL;
 static u32 porf_promise_job_head = 0;
 static u32 porf_promise_job_len = 0;
 static u32 porf_promise_job_cap = 0;
-
+`}
 static void (*porf_promise_run_coro_reaction_impl)(u32) = NULL;
 static void (*porf_native_fetch_run_response_reaction_impl)(u32) = NULL;
 
@@ -4449,11 +4821,11 @@ PORF_UN(u16) PORF_UN(u32) PORF_UN(u64) PORF_UN(f32) PORF_UN(f64)
 #endif
 
 // exceptions: setjmp-based, exception is a jsval
-${st}jmp_buf* porf_try_data;
+${threads ? '' : `${st}jmp_buf* porf_try_data;
 ${st}i32 porf_try_cap = 0;
 ${st}i32 porf_try_depth = 0;
 ${st}jsval porf_exception = {0.0, ${TYPES.undefined}};
-
+`}
 ${sti}jmp_buf* porf_try_ensure(void) {
   if (porf_try_depth > porf_try_cap) {
     while (porf_try_depth > porf_try_cap) porf_try_cap = porf_try_cap ? porf_try_cap << 1 : 8;
@@ -4464,9 +4836,9 @@ ${sti}jmp_buf* porf_try_ensure(void) {
 }
 
 // innermost open iterator record of the running coroutine
-${st}jsval porf_iter_open = {0.0, ${TYPES.undefined}};
+${threads ? '' : `${st}jsval porf_iter_open = {0.0, ${TYPES.undefined}};
 ${st}i32 porf_iter_base = 0;
-${iterClose ? `static void porf_iter_unwind(void);
+`}${iterClose ? `static void porf_iter_unwind(void);
 ` : ''}\
 ${toStr ? `jsval ${toStr}(jsval);
 ` : ''}\
@@ -4510,7 +4882,7 @@ PORF_NORETURN ${st}void porf_unreachable(const char* msg) {
   abort();
 }
 
-${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs)}
+${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 
 // ---- core layouts ----
 // array:      [len i32 @0][ent u32 @4][cap i32 @8]; entries = jsval[cap]
@@ -4532,7 +4904,13 @@ ${st}u32 porf_arr_new(i32 len, i32 cap) {
   memset(MEM + PORF_ARR_ENT(a), 0, (size_t)cap << 3);
   return a;
 }
-
+${threads ? `
+// per call stand-in for a builtin's static array literal (see K.DataRef)
+static inline u32 porf_scratch_arr(volatile u32* slot, i32 cap) {
+  if (*slot == 0) *slot = porf_arr_new(0, cap);
+  return *slot;
+}
+` : ''}
 ${sti}int porf_arr_has_own(u32 a, u32 i) {
   if (i >= (u32)PORF_ARR_LEN(a)) return 0;
   return *(jsbits*)(MEM + PORF_ARR_ENT(a) + ((u64)i << 3)) != 0;
@@ -4880,7 +5258,7 @@ static void porf_init(int argc, char** argv) {
 `;
 };
 
-const CORO_RUNTIME = () => `// ---- coroutines (stackless) ----
+const CORO_RUNTIME = (threads = false) => `// ---- coroutines (stackless) ----
 // record: header, frame, args. a generator is its record
 typedef struct porf_coro_call {
   jsval callee;
@@ -4906,9 +5284,9 @@ typedef struct porf_coro_call {
 #define PORF_CORO_HDR ((u32)((sizeof(porf_coro_call) + 7u) & ~7u))
 #define PORF_CORO_BYTES(frame, argc) (PORF_CORO_HDR + (frame) + (u32)(argc) * 8u)
 
-static porf_coro_call* porf_coro_cur = 0;
+${threads ? '' : 'static porf_coro_call* porf_coro_cur = 0;\n'}\
 #define PORF_CORO_RETURN porf_box(0.0, ${TYPES.__porffor_generator})
-static i32 porf_coro_mode = 0;
+${threads ? '' : 'static i32 porf_coro_mode = 0;\n'}\
 static jsval porf_coro_dispatch(porf_coro_call* call);
 static u32 porf_coro_frame_bytes(u32 idx);
 #ifndef PORF_GC_KIND_CORO

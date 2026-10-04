@@ -216,6 +216,7 @@ export default (code, module = Prefs.module, opts = {}) => {
         ...(objects ?? [ '-xc', '-', ...compileOnlyArgs ]),
         '-o', outFile ?? (process.platform === 'win32' ? 'out.exe' : 'out'), // set path for output
         '-lm', // link math.h
+        ...(cOut.threads ? [ '-pthread' ] : []),
         ...(objects ? [ ...compilerArgs, `-O${Prefs.O ?? 3}` ] : []),
         ...(isTinyCC ? [] : linkStripArgs)
       ];
