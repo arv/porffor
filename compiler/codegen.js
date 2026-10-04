@@ -3611,7 +3611,7 @@ const generateForIn = (scope, decl) => {
       const length = tmp(scope, T.i32);
       const objPtr = reuse(scope, JvPtr(Local(objName, T.jsval)));
       assign(scope, counter, Const(T.i32, 0));
-      assign(scope, length, Load('u16', objPtr, 0));
+      assign(scope, length, Load('i32', objPtr, 0));
       assign(scope, pointer, Load('u32', objPtr, 12));
 
       const L = fresh(scope), C = fresh(scope);
@@ -4061,7 +4061,7 @@ const generateObject = (scope, decl) => {
       stmt(scope, Store('u8', entries, slot * 20 + 16, Const(T.i32, 14)));
       stmt(scope, Store('u8', entries, slot * 20 + 17, JvType(val)));
       stmt(scope, Store('u8', entries, slot * 20 + 18, JvType(prop)));
-      stmt(scope, Store('u16', JvPtr(obj), 0, Const(T.i32, ++slot)));
+      stmt(scope, Store('i32', JvPtr(obj), 0, Const(T.i32, ++slot)));
       stmt(scope, If(canReferenceCheck(scope, val), [ GcBarrier(JvPtr(obj), Const(T.i32, TYPES.object)) ]));
     } else {
       slot = -1;

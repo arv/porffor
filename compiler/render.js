@@ -2398,28 +2398,28 @@ static inline i32 porf_gc_value_body(f64 value, i32 type) {
 static int porf_gc_object_shape_valid(i32 body) {
   if (!porf_gc_is_block_start(body)) return 0;
   const u32 block_size = porf_gc_block_size(body);
-  if (block_size < 16u) return 0;
-  const u32 size = *(u16*)(MEM + body);
-  const u32 capacity = *(u16*)(MEM + body + 2);
+  if (block_size < 20u) return 0;
+  const u32 size = *(u32*)(MEM + body);
+  const u32 capacity = *(u32*)(MEM + body + 4);
   if (size > capacity) return 0;
   const i32 entries = *(u32*)(MEM + body + 12);
   if (entries == 0) return size == 0;
   const u64 entry_bytes = (u64)capacity * 20ull;
-  if (entries == body + 16) return 16ull + entry_bytes <= (u64)block_size;
+  if (entries == body + 20) return 20ull + entry_bytes <= (u64)block_size;
   if (porf_gc_in_static(entries)) return porf_gc_static_range(entries, entry_bytes);
   if (!porf_gc_is_block_start(entries)) return 0;
   return entry_bytes <= (u64)porf_gc_block_size(entries);
 }
 
 static int porf_gc_static_object_shape_valid(i32 body) {
-  if (!porf_gc_static_range(body, 16ull)) return 0;
-  const u32 size = *(u16*)(MEM + body);
-  const u32 capacity = *(u16*)(MEM + body + 2);
+  if (!porf_gc_static_range(body, 20ull)) return 0;
+  const u32 size = *(u32*)(MEM + body);
+  const u32 capacity = *(u32*)(MEM + body + 4);
   if (size > capacity) return 0;
   const i32 entries = *(u32*)(MEM + body + 12);
   if (entries == 0) return size == 0;
   const u64 entry_bytes = (u64)capacity * 20ull;
-  if (entries == body + 16) return porf_gc_static_range(body, 16ull + entry_bytes);
+  if (entries == body + 20) return porf_gc_static_range(body, 20ull + entry_bytes);
   if (porf_gc_in_static(entries)) return porf_gc_static_range(entries, entry_bytes);
   if (!porf_gc_is_block_start(entries)) return 0;
   return entry_bytes <= (u64)porf_gc_block_size(entries);
@@ -2776,13 +2776,13 @@ static void porf_gc_scan_body(i32 body, i32 type) {
     }
     case ${TYPES.object}: {
       const i32 proto = *(u32*)(MEM + body + 8);
-      const i32 proto_type = *(u8*)(MEM + body + 5);
+      const i32 proto_type = *(u8*)(MEM + body + 17);
       if (proto != 0 || proto_type != ${TYPES.undefined}) porf_gc_mark_js((f64)proto, proto_type);
-      u32 size = *(u16*)(MEM + body);
+      u32 size = *(u32*)(MEM + body);
       const i32 entries = *(u32*)(MEM + body + 12);
       if (entries != 0) {
         porf_gc_mark_body(entries);
-        if (entries != body + 16) {
+        if (entries != body + 20) {
           porf_gc_set_kind(entries, PORF_GC_KIND_OBJECT_ENTRIES);
           if (porf_gc_is_block_start(entries)) {
             const u32 max_size = porf_gc_block_size(entries) / 20u;
@@ -4002,9 +4002,8 @@ ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs)}
 
 // ---- core layouts ----
 // array:      [len i32 @0][ent u32 @4][cap i32 @8]; entries = jsval[cap]
-// object:     [count i32 @0][bcap i32 @4][ent u32 @8][buckets u32 @12]
-//             entries = {key jsval, val jsval}[count] in insertion order
-//             buckets = i32[bcap] entry indices, -1 empty (ordered hashmap)
+// object:     [size u32 @0][cap u32 @4][proto u32 @8][ent u32 @12][flags u8 @16][proto type u8 @17]
+//             entries = 20-byte records in insertion order (see _internal_object.ts)
 // bytestring: [len u32 @0][bytes @4]
 // function:   [fnIdx u32 @0][env u32 @4]; env = jsval slots
 // array header padded to 16 so inline entries stay 8-aligned

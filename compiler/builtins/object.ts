@@ -31,7 +31,7 @@ export const __Object_keys = (obj: any): any[] => {
     const arrayObj: any[] = obj as any[];
     arrayLen = arrayObj.length;
     obj = __Porffor_object_underlying(obj);
-    const objectEntries: i32 = Porffor.type(obj) == Porffor.TYPES.object ? Porffor.IR.loadU16(obj, 0) : 0;
+    const objectEntries: i32 = Porffor.type(obj) == Porffor.TYPES.object ? Porffor.IR.loadI32(obj, 0) : 0;
     for (let j: i32 = 0; j < arrayLen; j++) {
       const key: any = Porffor.callThis(__Number_prototype_toString, j);
       if (objectEntries != 0) {
@@ -50,7 +50,7 @@ export const __Object_keys = (obj: any): any[] => {
 
   if (Porffor.type(obj) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(obj);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadI32(obj, 0) * 20;
 
     for (; ptr < endPtr; ptr += 20) {
       if (!Porffor.object.isEnumerable(ptr)) continue;
@@ -206,7 +206,7 @@ export const __Object_assign = (target: any, ...sources: any[]): any => {
     src = __Porffor_object_underlying(src);
     if (Porffor.type(src) == Porffor.TYPES.object) {
       let ptr: i32 = Porffor.object.entriesPtr(src);
-      const endPtr: i32 = ptr + Porffor.IR.loadU16(src, 0) * 20;
+      const endPtr: i32 = ptr + Porffor.IR.loadI32(src, 0) * 20;
 
       for (; ptr < endPtr; ptr += 20) {
         const tail: i32 = Porffor.IR.loadU16(ptr, 16);
@@ -447,7 +447,7 @@ export const __Object_getOwnPropertyNames = (obj: any): any[] => {
   obj = __Porffor_object_underlying(obj);
   if (Porffor.type(obj) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(obj);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadI32(obj, 0) * 20;
 
     for (; ptr < endPtr; ptr += 20) {
       if (Porffor.IR.loadU8(ptr, 18) == Porffor.TYPES.symbol) continue;
@@ -468,7 +468,7 @@ export const __Object_getOwnPropertySymbols = (obj: any): any[] => {
   obj = __Porffor_object_underlying(obj);
   if (Porffor.type(obj) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(obj);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadI32(obj, 0) * 20;
 
     let i: i32 = 0;
     for (; ptr < endPtr; ptr += 20) {
@@ -690,7 +690,7 @@ export const __Porffor_object_spread = (dst: object, src: any): object => {
   src = __Porffor_object_underlying(src);
   if (Porffor.type(src) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(src);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(src, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadI32(src, 0) * 20;
 
     for (; ptr < endPtr; ptr += 20) {
       const tail: i32 = Porffor.IR.loadU16(ptr, 16);
@@ -731,7 +731,7 @@ export const __Porffor_object_rest = (dst: object, src: any, ...blocklist: any[]
   src = __Porffor_object_underlying(src);
   if (Porffor.type(src) == Porffor.TYPES.object) {
     let ptr: i32 = Porffor.object.entriesPtr(src);
-    const endPtr: i32 = ptr + Porffor.IR.loadU16(src, 0) * 20;
+    const endPtr: i32 = ptr + Porffor.IR.loadI32(src, 0) * 20;
     const blocklistLen: i32 = blocklist.length;
 
     for (; ptr < endPtr; ptr += 20) {
