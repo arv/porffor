@@ -56,6 +56,66 @@ export const __Porffor_json_canSerialize = (value: any): boolean => {
   return false;
 };
 
+export const __Porffor_json_quote = (buffer: i32, str: any): i32 => {
+  // 25.5.2.3 QuoteJSONString: https://tc39.es/ecma262/#sec-quotejsonstring
+  buffer = __Porffor_bytestring_bufferChar(buffer, 34); // start "
+
+  const len: i32 = str.length;
+  for (let i: i32 = 0; i < len; i++) {
+    const c: i32 = str.charCodeAt(i);
+    if (c < 0x20) {
+      if (c == 0x08) {
+        buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 98); // \b
+        continue;
+      }
+
+      if (c == 0x09) {
+        buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 116); // \t
+        continue;
+      }
+
+      if (c == 0x0a) {
+        buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 110); // \n
+        continue;
+      }
+
+      if (c == 0x0c) {
+        buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 102); // \f
+        continue;
+      }
+
+      if (c == 0x0d) {
+        buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 114); // \r
+        continue;
+      }
+
+      // \u00ff
+      buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 117); // \u
+      buffer = __Porffor_bytestring_buffer2Char(buffer, 48, 48); // 00
+
+      const h1: i32 = (c & 0xf0) / 0x10;
+      const h2: i32 = c & 0x0f;
+      buffer = __Porffor_bytestring_buffer2Char(buffer, h1 < 10 ? h1 + 48 : h1 + 87, h2 < 10 ? h2 + 48 : h2 + 87); // 0-9 or a-f
+      continue;
+    }
+
+    if (c == 0x22) { // "
+      buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 34); // \"
+      continue;
+    }
+
+    if (c == 0x5c) { // \
+      buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 92); // \\
+      continue;
+    }
+
+    // todo: support non-bytestrings
+    buffer = __Porffor_bytestring_bufferChar(buffer, c);
+  }
+
+  return __Porffor_bytestring_bufferChar(buffer, 34); // final "
+};
+
 export const __Porffor_json_serialize = (_buffer: i32, value: any, depth: i32, space: bytestring|undefined): i32 => {
   // somewhat modelled after 25.5.2.2 SerializeJSONProperty: https://tc39.es/ecma262/#sec-serializejsonproperty
   let buffer: i32 = _buffer;
@@ -73,62 +133,7 @@ export const __Porffor_json_serialize = (_buffer: i32, value: any, depth: i32, s
     (Porffor.type(value) | 0b10000000) == Porffor.TYPES.bytestring,
     Porffor.type(value) == Porffor.TYPES.stringobject
   )) { // string
-    buffer = __Porffor_bytestring_bufferChar(buffer, 34); // start "
-
-    const len: i32 = value.length;
-    for (let i: i32 = 0; i < len; i++) {
-      const c: i32 = value.charCodeAt(i);
-      if (c < 0x20) {
-        if (c == 0x08) {
-          buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 98); // \b
-          continue;
-        }
-
-        if (c == 0x09) {
-          buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 116); // \t
-          continue;
-        }
-
-        if (c == 0x0a) {
-          buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 110); // \n
-          continue;
-        }
-
-        if (c == 0x0c) {
-          buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 102); // \f
-          continue;
-        }
-
-        if (c == 0x0d) {
-          buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 114); // \r
-          continue;
-        }
-
-        // \u00ff
-        buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 117); // \u
-        buffer = __Porffor_bytestring_buffer2Char(buffer, 48, 48); // 00
-
-        const h1: i32 = (c & 0xf0) / 0x10;
-        const h2: i32 = c & 0x0f;
-        buffer = __Porffor_bytestring_buffer2Char(buffer, h1 < 10 ? h1 + 48 : h1 + 87, h2 < 10 ? h2 + 48 : h2 + 87); // 0-9 or a-f
-        continue;
-      }
-
-      if (c == 0x22) { // "
-        buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 34); // \"
-        continue;
-      }
-
-      if (c == 0x5c) { // \
-        buffer = __Porffor_bytestring_buffer2Char(buffer, 92, 92); // \\
-        continue;
-      }
-
-      // todo: support non-bytestrings
-      buffer = __Porffor_bytestring_bufferChar(buffer, c);
-    }
-
-    return __Porffor_bytestring_bufferChar(buffer, 34); // final "
+    return __Porffor_json_quote(buffer, value);
   }
 
   if (Porffor.fastOr(
@@ -203,9 +208,7 @@ export const __Porffor_json_serialize = (_buffer: i32, value: any, depth: i32, s
         for (let i: i32 = 0; i < depth; i++) buffer = __Porffor_bytestring_bufferStr(buffer, space as bytestring);
       }
 
-      buffer = __Porffor_bytestring_bufferChar(buffer, 34); // "
-      buffer = __Porffor_bytestring_bufferStr(buffer, key);
-      buffer = __Porffor_bytestring_bufferChar(buffer, 34); // "
+      buffer = __Porffor_json_quote(buffer, key);
 
       buffer = __Porffor_bytestring_bufferChar(buffer, 58); // :
       if (hasSpace) buffer = __Porffor_bytestring_bufferChar(buffer, 32); // space
