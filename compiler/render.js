@@ -111,9 +111,11 @@ const cReservedNames = new Set([
   'clock_getres', 'ctime_r', 'asctime_r', 'gmtime_r', 'localtime_r', 'gettimeofday'
 ]);
 
-// inlining these has little perf benefit and significantly increases binary size
+// inlining these has little perf benefit and significantly increases binary size.
+// lookupHit: the cold half of object_lookup, out of line so the hot scan needs no stack frame
 const NEVER_INLINE = new Set([
-  '__Porffor_object_get_ic', '__Porffor_object_get_icMiss', '__Porffor_object_get_withHash'
+  '__Porffor_object_get_ic', '__Porffor_object_get_icMiss', '__Porffor_object_get_withHash',
+  '__Porffor_object_lookupHit'
 ]);
 
 const sanitizeMemo = new Map();
