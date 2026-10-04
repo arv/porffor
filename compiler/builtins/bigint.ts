@@ -12,7 +12,8 @@ export const __Porffor_bigint_fromDigits = (negative: boolean, digits: i32[]): b
 
   let allZero: boolean = true;
   for (let i: i32 = 0; i < len; i++) {
-    const d: i32 = digits[i];
+    // digits may be given as u32s, wrap instead of saturating
+    const d: i32 = digits[i] | 0;
     if (d != 0) allZero = false;
 
     Porffor.IR.storeI32(ptr + i * 4, 4, d);
@@ -115,7 +116,7 @@ export const __Porffor_bigint_fromString = (n: string|bytestring): bigint => {
 
   const result: i32[] = Porffor.array.new(digitLen);
   while (digits.length > 0) {
-    let carry: i32 = 0;
+    let carry: number = 0;
     for (let j: i32 = 0; j < digits.length; j++) {
       let value: number = carry * radix + digits[j];
       let quotient: i32 = Math.floor(value / BASE);
