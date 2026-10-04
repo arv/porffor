@@ -1191,7 +1191,7 @@ const irBuiltinHelpers = (scope, name, def) => ({
   global: (name, type, init) => {
     if (!(name in globals)) {
       const idx = globals['#ind']++;
-      globals[name] = { idx, type };
+      globals[name] = { idx, type, builtin: true };
     }
     if (init !== undefined && !includedBuiltinGlobalInits.has(name)) {
       includedBuiltinGlobalInits.add(name);
@@ -5358,6 +5358,11 @@ export default (program, opts = {}) => {
   }
   irFinalizers.length = 0;
 
+  // threads: build every included builtin object up front, after the builtin globals
+  // it may use exist and before any thread can race its lazy init
+  if (funcs.some(f => f.name === '__Porffor_thread_run' && f.body)) {
+    topLevelFunc.body.unshift(...funcs.filter(f => f.body && f.name.startsWith('#get_')).map(f => Call(f.index, [], f.retType)));
+  }
   if (builtinGlobalInits.length !== 0) topLevelFunc.body.unshift(...builtinGlobalInits);
 
   // render input: funcs indexed by func.index, ungenerated ones null (tree-shaken to a trapping stub), globals as {name, type}
@@ -5367,7 +5372,7 @@ export default (program, opts = {}) => {
   const renderGlobals = [];
   for (const name in globals) {
     if (name === '#ind') continue;
-    renderGlobals.push({ name, type: globals[name].type ?? T.jsval });
+    renderGlobals.push({ name, type: globals[name].type ?? T.jsval, builtin: !!globals[name].builtin });
   }
 
   return {
@@ -5376,6 +5381,8 @@ export default (program, opts = {}) => {
     dataUnits,
     units: program._units ?? null,
     globals: renderGlobals,
+    // re-run per thread for builtin globals that become thread-local
+    globalInits: { body: builtinGlobalInits, locals: topLevelFunc.locals },
     entry: entryName,
     prefs: rawHead.length ? { ...Prefs, rawHead: [ Prefs.rawHead, ...rawHead ].filter(Boolean).join('\n') } : Prefs,
     usedTypes

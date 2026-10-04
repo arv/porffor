@@ -203,6 +203,17 @@ export const __Porffor_underlyingRebuild = (): void => {
 };
 
 export const __Porffor_object_underlying = (_obj: any): any => {
+  if (Porffor.type(_obj) == Porffor.TYPES.object) return _obj;
+
+  // the underlying store is shared by every thread
+  Porffor.c`porf_builtin_lock();`;
+  const out: any = __Porffor_object_underlyingLocked(_obj);
+  Porffor.c`porf_builtin_unlock();`;
+  return out;
+};
+
+// caller holds the builtin lock
+export const __Porffor_object_underlyingLocked = (_obj: any): any => {
   const objType: i32 = Porffor.type(_obj);
   if (objType == Porffor.TYPES.object) return _obj;
 

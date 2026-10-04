@@ -255,7 +255,7 @@ const f64Lit = value => {
   return `porf_bits_to_f64(0x${hex}ull)`;
 };
 
-export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, prefs = {}, usedTypes = null, units = null }) => {
+export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = null, entry = null, prefs = {}, usedTypes = null, units = null }) => {
   // split: one C file per unit sharing a header, link-time constants as externs
   const split = !!prefs.split;
   const st = split ? '' : 'static ';
@@ -342,6 +342,16 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     if (split) throw new Error('porffor: Thread is not supported with multi-unit (module) builds yet');
     if (prefs.nativeFetch) throw new Error('porffor: Thread is not supported with native fetch yet');
   }
+
+  // builtin module state (regex compiler, scratch buffers, caches...) is per thread when
+  // threads are used; these few tables are shared by every thread and locked instead
+  const sharedBuiltinGlobal = name => /^getptr_|^#wellknown_/.test(name) ||
+    name === 'underlyingStore' || name === 'underlyingBuckets' || name === 'underlyingBucketsCap' || name === 'forStore';
+  const threadGlobals = usesThreads ? globals.filter(g => g.builtin && !sharedBuiltinGlobal(g.name)) : [];
+  const threadGlobalSet = new Set(threadGlobals.map(g => g.name));
+  const gname = name => threadGlobalSet.has(name) ? `porf_ts->tg->${sanitize(name)}` : sanitize(name);
+  // per-thread stand-ins for builtin static array literals: data segment id -> capacity
+  const scratchArrs = new Map();
   const promiseResolveFunc = funcByName.get('__Porffor_promise_resolve');
   const settleAsyncResult = promiseResolveFunc
     ? (value, promise) => `(void)${fnSym(promiseResolveFunc)}(${value}, ${promise});`
@@ -450,20 +460,6 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     return node.some(hasAlloc);
   };
 
-  const scratchIds = (node, out = new Set()) => {
-    if (!Array.isArray(node)) return out;
-    if (isNode(node)) {
-      if (node[N_KIND] === K.DataRef && node[N_B] === 1) out.add(node[N_A]);
-      scratchIds(node[N_A], out);
-      scratchIds(node[N_B], out);
-      scratchIds(node[N_C], out);
-    } else for (let i = 0; i < node.length; i++) scratchIds(node[i], out);
-    return out;
-  };
-  const emitScratchSlots = body => {
-    if (!usesThreads) return;
-    for (const id of scratchIds(body)) emit(`  PORF_ROOT u32 porf_sa${id} = 0;\n`);
-  };
 
   // builtins keep raw heap pointers in i32 locals: those must be gc-visible too
   const allocLocals = (node, out = new Set()) => {
@@ -497,8 +493,13 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
 
       case K.DataRef: {
         const id = node[N_A];
-        // a builtin's static array literal is shared scratch: give each call its own
-        if (usesThreads && node[N_B] === 1) return [`porf_scratch_arr(&porf_sa${id}, ${(data[id].length - 16) >> 3})`, P_POSTFIX];
+        // a builtin's static array literal is scratch that persists across calls (builtins
+        // may keep pointers to it): give each thread its own persistent copy
+        if (usesThreads && node[N_B] === 1) {
+          const cap = (data[id].length - 16) >> 3;
+          scratchArrs.set(id, cap);
+          return [`porf_scratch_arr(&porf_ts->tg->sa${id}, ${cap})`, P_POSTFIX];
+        }
         if (!split) return [`${dataOffsets[id]}u`, P_PRIM];
         const u = dataUnits[id];
         cur.dbases[u] = true;
@@ -514,6 +515,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
 
       case K.Global:
         cur.globals[node[N_A]] = true;
+        return [gname(node[N_A]), P_POSTFIX];
       case K.Local:
         return [sanitize(node[N_A]), P_PRIM];
 
@@ -706,7 +708,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       case K.Assign:
         if (coro && isSuspend(node[N_B])) return renderSuspend(node[N_A], node[N_B]);
         if (node[N_A][N_KIND] === K.Global) cur.globals[node[N_A][N_A]] = true;
-        emit(`${ind()}${sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\n`);
+        emit(`${ind()}${node[N_A][N_KIND] === K.Global ? gname(node[N_A][N_A]) : sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\n`);
         return;
 
       case K.Store: {
@@ -747,7 +749,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         const [stmts, label] = node[N_C];
         const updateC = update == null ? null
           : update[N_KIND] === K.Assign
-            ? `${sanitize(update[N_A][N_A])} = ${rx(update[N_B], P_COMMA)}`
+            ? `${update[N_A][N_KIND] === K.Global ? gname(update[N_A][N_A]) : sanitize(update[N_A][N_A])} = ${rx(update[N_B], P_COMMA)}`
             : rx(update, P_COMMA);
         // resume through the header, a second loop entry would make the cfg irreducible
         const region = coro && hasSuspend(stmts) ? { id: coro.regions.length, cases: [] } : null;
@@ -765,7 +767,9 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
         breakStack.push(label);
         if (label) labelTry.set(label, activeTryDepth);
         depth++;
-        if (usesThreads) emit(`${ind()}PORF_SAFEPOINT();\n`);
+        // builtins only reach a collection at allocations, which their internal tables rely
+        // on (eg the gc drops the underlying store's buckets), so only user loops get one
+        if (usesThreads && !curInternal) emit(`${ind()}PORF_SAFEPOINT();\n`);
         renderStmts(stmts);
         if (region) coro.path.pop();
         if (label && usedLabels.has(label + '_c')) emit(`${ind()}${sanitize(label)}_c:;\n`);
@@ -1325,6 +1329,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   const zeroReturn = t => t === T.none ? 'return;' : t === T.jsval ? 'return JV_UNDEFINED;' : 'return 0;';
 
   const renderCoroFunc = f => {
+    curInternal = !!f.internal;
     const sym = fnSym(f);
     suspendMemo = new Map();
     coroTmps = Object.create(null);
@@ -1370,7 +1375,6 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       const q = allocd.has(n) && (t === T.i32 || t === T.u32) ? 'PORF_ROOT ' : rootQual(t);
       emit(`  ${q}${CT[t]} ${n}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
     }
-    emitScratchSlots(body);
 
     const { pre, args } = invokeArgs(f, { env: 'porf_fr->env', thisv: 'porf_fr->thisv', newtv: 'porf_fr->newtv', callee: 'porf_fr->callee', argc: 'porf_fr->argc', argv: 'porf_coro_argv(porf_fr)',
       arg: j => `porf_unpack(porf_fr->argc > ${j} ? porf_coro_argv(porf_fr)[${j}] : JV_UNDEFINED_BITS)` });
@@ -1400,8 +1404,10 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     suspendMemo = coroTmps = coroLocals = null;
   };
 
+  let curInternal = false;
   const renderFunc = f => {
     cur = partsOf(unitOf(f));
+    curInternal = !!f.internal;
     if (needsCoro(f)) return renderCoroFunc(f);
     const ret = CT[f.retType];
     const params = f.params.map(p => `${rootQual(p.type)}${CT[p.type]} ${sanitize(p.name)}`).join(', ');
@@ -1418,7 +1424,6 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
       const q = allocd.has(name) && (t === T.i32 || t === T.u32) ? 'PORF_ROOT ' : rootQual(t);
       emit(`  ${q}${CT[t]} ${sanitize(name)}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
     }
-    emitScratchSlots(f.body);
     renderStmts(f.body);
     emit(`}\n\n`);
   };
@@ -1540,31 +1545,52 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
   }
 
   // module globals (top-level JS bindings)
-  for (const g of globals) link.push(`${st}${CT[g.type]} ${sanitize(g.name)}${g.type === T.jsval ? ` = {0.0, ${TYPES.undefined}}` : ''};\n`);
+  for (const g of globals) {
+    if (threadGlobalSet.has(g.name)) continue;
+    link.push(`${st}${CT[g.type]} ${sanitize(g.name)}${g.type === T.jsval ? ` = {0.0, ${TYPES.undefined}}` : ''};\n`);
+  }
+  if (usesThreads) {
+    // all zero is the right start (undefined jsvals); non-zero inits rerun per thread
+    link.push(`struct porf_tglobals {${threadGlobals.map(g => ` ${CT[g.type]} ${sanitize(g.name)};`).join('')}${[ ...scratchArrs.keys() ].map(id => ` u32 sa${id};`).join('')} u8 _; };\n`);
+    link.push(`static struct porf_tglobals porf_main_tg;\n`);
+  }
   link.push('\n');
   if (gcEnabled) {
     const markGlobalRootLines = [];
     const markGlobalRawLines = [];
+    const markThreadRootLines = [];
+    const markThreadRawLines = [];
     for (const g of globals) {
-      const name = sanitize(g.name);
-      if (g.type === T.jsval) markGlobalRootLines.push(`  porf_gc_mark_js(${name}.val, ${name}.type);`);
+      const name = gname(g.name);
+      const perThread = threadGlobalSet.has(g.name);
+      const rootLines = perThread ? markThreadRootLines : markGlobalRootLines;
+      const rawLines = perThread ? markThreadRawLines : markGlobalRawLines;
+      if (g.type === T.jsval) rootLines.push(`  porf_gc_mark_js(${name}.val, ${name}.type);`);
       else if (g.type === T.ptr || (g.type === T.i32 && /(?:underlyingStore|underlyingBuckets|__Porffor_regex_cache)$/.test(g.name))) {
         if (/underlyingStore$/.test(g.name)) {
           const buckets = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBuckets'));
           const bucketsCap = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBucketsCap'));
-          markGlobalRawLines.push(`  if (porf_gc_mark_underlying_store((i32)${name})) { ${buckets} = 0; ${bucketsCap} = 0; }`);
+          rawLines.push(`  if (porf_gc_mark_underlying_store((i32)${name})) { ${buckets} = 0; ${bucketsCap} = 0; }`);
         }
-        else if (/underlyingBuckets$/.test(g.name)) markGlobalRawLines.push(`  porf_gc_mark_raw((i32)${name});`);
-        else if (/__Porffor_regex_cache$/.test(g.name)) markGlobalRawLines.push(`  porf_gc_mark_regex_cache((i32)${name});`);
+        else if (/underlyingBuckets$/.test(g.name)) rawLines.push(`  porf_gc_mark_raw((i32)${name});`);
+        else if (/__Porffor_regex_cache$/.test(g.name)) rawLines.push(`  porf_gc_mark_regex_cache((i32)${name});`);
         else if (/getptr_/.test(g.name)) {
           const builtinName = g.name.slice(g.name.lastIndexOf('getptr_') + 'getptr_'.length);
-          markGlobalRootLines.push(`  if (${name} != 0) porf_gc_mark_js((f64)${name}, ${funcByName.has(builtinName) ? TYPES.function : TYPES.object});`);
+          rootLines.push(`  if (${name} != 0) porf_gc_mark_js((f64)${name}, ${funcByName.has(builtinName) ? TYPES.function : TYPES.object});`);
         }
-        else markGlobalRawLines.push(`  porf_gc_mark_raw((i32)${name});`);
+        else rawLines.push(`  porf_gc_mark_raw((i32)${name});`);
       }
     }
     link.push(`${st}void porf_gc_mark_global_roots(void) {\n${markGlobalRootLines.join('\n') || '  (void)0;'}\n}\n\n`);
     link.push(`${st}void porf_gc_mark_global_raw_roots(void) {\n${markGlobalRawLines.join('\n') || '  (void)0;'}\n}\n\n`);
+    // per-thread builtin globals of the thread porf_ts currently points at
+    if (usesThreads) {
+      // builtins store into these without barriers, as static data is rescanned every
+      // collection: rescan their entries every collection too, even once they are old
+      for (const id of scratchArrs.keys()) markThreadRootLines.push(`  if (porf_ts->tg->sa${id} != 0) { porf_gc_mark_js((f64)porf_ts->tg->sa${id}, ${TYPES.array}); porf_gc_mark_array_like((i32)porf_ts->tg->sa${id}); }`);
+      link.push(`static void porf_gc_mark_thread_global_roots(void) {\n${markThreadRootLines.join('\n') || '  (void)0;'}\n}\n\n`);
+      link.push(`static void porf_gc_mark_thread_global_raw_roots(void) {\n${markThreadRawLines.join('\n') || '  (void)0;'}\n}\n\n`);
+    }
     link.push(usesCoro
       ? `${st}void porf_gc_mark_coro_roots(void) {\n  for (porf_coro_call* c = porf_coro_cur; c; c = c->parent) {\n    if (c->heap) porf_gc_mark_coro(c->heap);\n      else porf_coro_gc_scan(c);\n  }\n}\n\n${st}void porf_gc_mark_coro(u32 body) {\n  if (body != 0 && porf_gc_mark_body((i32)body)) porf_coro_gc_scan((porf_coro_call*)(MEM + body));\n}\n\n${st}void porf_gc_scan_coro(i32 body) {\n  porf_coro_gc_scan((porf_coro_call*)(MEM + body));\n}\n\n`
       : `${st}void porf_gc_mark_coro_roots(void) {}\n${st}void porf_gc_mark_coro(u32 body) { (void)body; }\n${st}void porf_gc_scan_coro(i32 body) { (void)body; }\n\n`);
@@ -2178,11 +2204,30 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
     const runCall = obj => `${fnSym(threadRunFunc)}(${runParam.type === T.jsval ? `porf_box((f64)${obj}, ${TYPES.thread})` : obj})`;
     const runJobs = funcByName.get('__Porffor_promise_runJobs');
     const runJobsCall = runJobs?.body ? `(void)${fnSym(runJobs)}(${runJobs.params.length === 0 ? '' : 'JV_UNDEFINED, JV_UNDEFINED'})` : null;
-    emit(THREAD_RUNTIME(runCall, runJobsCall, prefs));
+    // builtin globals that became per thread rerun their inits on every new thread
+    let initCall = null;
+    const inits = (globalInits?.body ?? []).filter(x => isNode(x) && x[N_KIND] === K.Assign && x[N_A][N_KIND] === K.Global && threadGlobalSet.has(x[N_A][N_A]));
+    if (inits.length !== 0) {
+      const used = new Set();
+      const walk = n => {
+        if (!Array.isArray(n)) return;
+        if (isNode(n)) {
+          if (n[N_KIND] === K.Local) used.add(n[N_A]);
+          walk(n[N_A]); walk(n[N_B]); walk(n[N_C]);
+        } else n.forEach(walk);
+      };
+      walk(inits);
+      const locals = {};
+      for (const name of used) locals[name] = globalInits.locals?.[name] ?? { type: T.jsval };
+      const initFunc = { name: '#thread_globals_init', index: -1, internal: true, params: [], locals, retType: T.none, body: inits };
+      renderFunc(initFunc);
+      initCall = `${fnSym(initFunc)}()`;
+    }
+    emit(THREAD_RUNTIME(runCall, runJobsCall, initCall, prefs));
   }
 
   if (entry && !prefs.nativeFetch) {
-    emit(`int main(int argc, char** argv) {\n  porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n  ${usesThreads ? 'porf_threads_finish();\n  ' : ''}return 0;\n}\n`);
+    emit(`int main(int argc, char** argv) {\n  ${usesThreads ? 'porf_main_ts.tg = &porf_main_tg;\n  ' : ''}porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n  ${usesThreads ? 'porf_threads_finish();\n  ' : ''}return 0;\n}\n`);
   }
 
   if (usesMath) prelude.splice(1, 0, '#include <math.h>\n');
@@ -2507,6 +2552,7 @@ static void porf_gc_scan_coro(i32 body);
 static void porf_gc_cons_scan_range(const u64* lo, const u64* hi);
 static void porf_gc_mark_global_roots(void);
 static void porf_gc_mark_global_raw_roots(void);
+${threads ? 'static void porf_gc_mark_thread_global_roots(void);\nstatic void porf_gc_mark_thread_global_raw_roots(void);\n' : ''}\
 static void porf_gc_mark_coro_roots(void);
 static void porf_gc_scan_kind_block(i32 body);
 static void porf_gc_scan_body(i32 body, i32 type);
@@ -2771,7 +2817,7 @@ static int porf_gc_install_run(i32 ci, u32 pg) {
   m->cursor = (u16)j;
   w->lo = w->cur = base_addr + i * cls;
   w->end = base_addr + j * cls;
-  ${threads ? '__atomic_fetch_add(&porf_gc_window_bytes, (i64)((j - i) * cls), __ATOMIC_RELAXED);' : 'porf_gc_window_bytes += (i64)((j - i) * cls);'}
+  porf_gc_window_bytes += (i64)((j - i) * cls);
   porf_gc_touch_list(pg);
   return 1;
 }
@@ -2826,7 +2872,7 @@ static int porf_gc_refill_window(i32 ci) {
   }
   w->lo = w->cur = pg << PORF_GC_SPAGE_SHIFT;
   w->end = (pg << PORF_GC_SPAGE_SHIFT) + (u32)porf_gc_cls_slots[ci] * porf_gc_cls_size[ci];
-  ${threads ? '__atomic_fetch_add(&porf_gc_window_bytes, (i64)(w->end - w->cur), __ATOMIC_RELAXED);' : 'porf_gc_window_bytes += (i64)(w->end - w->cur);'}
+  porf_gc_window_bytes += (i64)(w->end - w->cur);
   porf_gc_touch_list(pg);
   return 1;
 }
@@ -2852,21 +2898,9 @@ static void porf_gc_minor(void);
 
 ${threads ? `// the allocator's shared state (pages, partial runs, budgets) is guarded by the gc lock
 // every running thread fills its own nursery share between minor collections
-#define PORF_GC_NURSERY_LIMIT ((i64)PORF_GC_NURSERY_BYTES * __atomic_load_n(&porf_threads_n, __ATOMIC_RELAXED))
+#define PORF_GC_NURSERY_LIMIT ((i64)PORF_GC_NURSERY_BYTES * porf_threads_n)
 static u32 porf_alloc_slow_locked(u32 bytes, u32 typeId);
 ${st}u32 porf_alloc_slow(u32 bytes, u32 typeId) {
-  // the next free run in the page this thread's window already owns needs no lock:
-  // only this thread touches that page's cursor and alloc bits until the next collection
-  if (bytes <= PORF_GC_MAX_SMALL && porf_heap_base != 0${minorsEnabled ? ' && __atomic_load_n(&porf_gc_window_bytes, __ATOMIC_RELAXED) < PORF_GC_NURSERY_LIMIT' : ''}) {
-    const u32 ci = porf_gc_cls_lut[(bytes + 7u) >> 3];
-    struct porf_gc_window* w = &porf_gc_active[ci];
-    if (w->end != 0) {
-      const u32 pg = porf_gc_chunk_start((w->end - 1u) >> PORF_GC_SPAGE_SHIFT) >> PORF_GC_SPAGE_SHIFT;
-      porf_gc_publish_window((i32)ci);
-      w->cur = w->end = w->lo = 0;
-      if (porf_gc_install_run((i32)ci, pg)) return porf_alloc(bytes, typeId);
-    }
-  }
   porf_gc_lock_acquire();
   const u32 out = porf_alloc_slow_locked(bytes, typeId);
   porf_gc_lock_release();
@@ -2878,8 +2912,8 @@ static u32 porf_alloc_slow_locked(u32 bytes, u32 typeId) {` : `${st}u32 porf_all
     porf_arena_init();
     return porf_alloc_slow(bytes, typeId);
   }
-${minorsEnabled ? threads ? `  if (__atomic_load_n(&porf_gc_window_bytes, __ATOMIC_RELAXED) >= PORF_GC_NURSERY_LIMIT || porf_gc_span_bytes >= 8388608ll * __atomic_load_n(&porf_threads_n, __ATOMIC_RELAXED)) {
-    __atomic_store_n(&porf_gc_window_bytes, 0, __ATOMIC_RELAXED);
+${minorsEnabled ? threads ? `  if (porf_gc_window_bytes >= PORF_GC_NURSERY_LIMIT || porf_gc_span_bytes >= 8388608ll * porf_threads_n) {
+    porf_gc_window_bytes = 0;
     porf_gc_span_bytes = 0;
     porf_gc_minor();
   }
@@ -4227,6 +4261,7 @@ ${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
     porf_gc_mark_js(porf_exception.val, porf_exception.type);
     porf_gc_mark_js(porf_iter_open.val, porf_iter_open.type);
     if (t->thread_obj != 0) porf_gc_mark_js((f64)t->thread_obj, ${TYPES.thread});
+    porf_gc_mark_thread_global_roots();
   }
   porf_ts = porf_gc_collector;` : `  porf_gc_mark_cons_roots();
   porf_gc_mark_js(porf_exception.val, porf_exception.type);
@@ -4235,6 +4270,12 @@ ${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
   porf_gc_drain_mark_queue();
   if (minor) porf_gc_scan_cards();
   porf_gc_mark_global_raw_roots();
+${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
+    porf_ts = t;
+    porf_gc_mark_thread_global_raw_roots();
+  }
+  porf_ts = porf_gc_collector;
+` : ''}\
   porf_gc_drain_mark_queue();
   porf_gc_process_weakmaps();
   porf_gc_drain_mark_queue();
@@ -4303,6 +4344,7 @@ const THREAD_HEAD = () => `
 
 struct porf_gc_window;
 struct porf_coro_call;
+struct porf_tglobals;
 typedef struct porf_tstate {
   jmp_buf* try_data;
   i32 try_cap;
@@ -4319,6 +4361,8 @@ typedef struct porf_tstate {
   i32 coro_mode;
   struct porf_gc_window* gc_active;
   i32 gc_lock_depth;
+  i32 builtin_lock_depth;
+  struct porf_tglobals* tg;
   u32 thread_obj;
   void* stack_lo;
   jmp_buf regs;
@@ -4400,12 +4444,26 @@ static void porf_gc_lock_release(void) {
   if (--porf_ts->gc_lock_depth == 0) pthread_mutex_unlock(&porf_gc_lock);
 }
 
+// guards builtin tables every thread shares (symbol registry, hidden props). reentrant,
+// and a waiter counts as parked like with the gc lock
+static pthread_mutex_t porf_builtin_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void porf_builtin_lock(void) {
+  if (porf_ts->builtin_lock_depth++ > 0) return;
+  if (pthread_mutex_trylock(&porf_builtin_mutex) == 0) return;
+  porf_blocking_enter();
+  pthread_mutex_lock(&porf_builtin_mutex);
+  porf_blocking_exit();
+}
+static void porf_builtin_unlock(void) {
+  if (--porf_ts->builtin_lock_depth == 0) pthread_mutex_unlock(&porf_builtin_mutex);
+}
+
 static i32 porf_thread_spawn(u32 obj);
 static void porf_thread_join(u32 obj);
 static void porf_threads_finish(void);
 `;
 
-const THREAD_RUNTIME = (runCall, runJobsCall, prefs) => {
+const THREAD_RUNTIME = (runCall, runJobsCall, initCall, prefs) => {
   const stackKiB = parseInt(prefs.threadStack) || 0;
   return `// ---- threads ----
 #ifndef PORF_THREAD_STACK
@@ -4457,6 +4515,7 @@ static void porf_thread_free(porf_tstate* t) {
   free(t->try_data);
   free(t->job_queue);
   free(t->gc_active);
+  free(t->tg);
   free(t);
 }
 
@@ -4465,6 +4524,7 @@ static void* porf_thread_main(void* arg) {
   porf_ts = t;
   volatile int porf_stack_anchor = 0;
   t->c_stack_top = (void*)&porf_stack_anchor;
+${initCall ? `  ${initCall};\n` : ''}\
   ${runCall('t->thread_obj')};
 ${runJobsCall ? `  ${runJobsCall};\n` : ''}\
   // publish completion while still registered: the Thread object is rooted until unregistering
@@ -4483,8 +4543,10 @@ ${runJobsCall ? `  ${runJobsCall};\n` : ''}\
 static i32 porf_thread_spawn(u32 obj) {
   porf_tstate* t = (porf_tstate*)calloc(1, sizeof(porf_tstate));
   struct porf_gc_window* w = (struct porf_gc_window*)calloc(PORF_GC_NCLASSES, sizeof(struct porf_gc_window));
-  if (!t || !w) { free(t); free(w); return 0; }
+  struct porf_tglobals* tg = (struct porf_tglobals*)calloc(1, sizeof(struct porf_tglobals));
+  if (!t || !w || !tg) { free(t); free(w); free(tg); return 0; }
   t->gc_active = w;
+  t->tg = tg;
   t->exception = JV_UNDEFINED;
   t->iter_open = JV_UNDEFINED;
   t->thread_obj = obj;
@@ -4627,7 +4689,7 @@ ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #endif
 extern const u32 porf_static_end;
 #define PORF_GC_ENABLED ${prefs.gc === false ? 0 : 1}
-${threads ? THREAD_HEAD() : ''}
+${threads ? THREAD_HEAD() : '#define porf_builtin_lock() ((void)0)\n#define porf_builtin_unlock() ((void)0)\n'}
 #define JV_PATTERN 0xFFF8000000000000ull
 #define JV_TYPE_MASK 0x07F8000000000000ull
 #define JV_UNDEFINED_BITS (JV_PATTERN | ((u64)${TYPES.undefined} << 43))
@@ -4921,8 +4983,8 @@ ${st}u32 porf_arr_new(i32 len, i32 cap) {
   return a;
 }
 ${threads ? `
-// per call stand-in for a builtin's static array literal (see K.DataRef)
-static inline u32 porf_scratch_arr(volatile u32* slot, i32 cap) {
+// per thread stand-in for a builtin's static array literal (see K.DataRef)
+static inline u32 porf_scratch_arr(u32* slot, i32 cap) {
   if (*slot == 0) *slot = porf_arr_new(0, cap);
   return *slot;
 }

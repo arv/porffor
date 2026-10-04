@@ -64,13 +64,19 @@ export const __Symbol_prototype_valueOf = function (this: Symbol) {
 };
 
 const forStore: Map = new Map();
+// the registry is shared by every thread
 export const __Symbol_for = (key: any): Symbol => {
   key = ecma262.ToString(key);
 
-  if (forStore.has(key)) return forStore.get(key);
-
-  const out: Symbol = Symbol(key);
-  forStore.set(key, out);
+  Porffor.c`porf_builtin_lock();`;
+  let out: Symbol;
+  if (forStore.has(key)) {
+    out = forStore.get(key);
+  } else {
+    out = Symbol(key);
+    forStore.set(key, out);
+  }
+  Porffor.c`porf_builtin_unlock();`;
 
   return out;
 };
@@ -81,7 +87,9 @@ export const __Symbol_keyFor = (arg: any): any => {
   const sym: Symbol = arg;
   const desc: any = sym.description;
 
+  Porffor.c`porf_builtin_lock();`;
   const stored: Symbol = forStore.get(desc);
+  Porffor.c`porf_builtin_unlock();`;
   if (sym == stored) return desc;
 
   return undefined;
