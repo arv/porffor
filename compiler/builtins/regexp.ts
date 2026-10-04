@@ -3236,7 +3236,8 @@ export const __Porffor_regex_compile = (patternStr: bytestring|string, flagsStr:
     __Porffor_regex_mruCaps = caps;
   }
 
-  const re: i32 = Porffor.malloc(24);
+  // typed so the gc traces it: a stack root only finds the pattern/blob through the type
+  const re: RegExp = Porffor.malloc(24);
   Porffor.IR.storeI32(re, 0, patternStr);
   Porffor.IR.storeU16(re, 4, flags);
   Porffor.IR.storeU16(re, 6, caps);
@@ -3245,7 +3246,7 @@ export const __Porffor_regex_compile = (patternStr: bytestring|string, flagsStr:
   Porffor.IR.storeI32(re, 16, names == 0 ? 0 : Porffor.IR.ptr(names));
   Porffor.IR.storeU8(re, 20, 0);
   Porffor.IR.storeU8(re, 22, Porffor.type(patternStr));
-  return re as RegExp;
+  return re;
 };
 
 // match driver mode: 0 exec result, 1 test boolean, 2 positions only (returns end, sets mStart/mEnd,

@@ -1566,7 +1566,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
       const rootLines = perThread ? markThreadRootLines : markGlobalRootLines;
       const rawLines = perThread ? markThreadRawLines : markGlobalRawLines;
       if (g.type === T.jsval) rootLines.push(`  porf_gc_mark_js(${name}.val, ${name}.type);`);
-      else if (g.type === T.ptr || (g.type === T.i32 && /(?:underlyingStore|underlyingBuckets|__Porffor_regex_cache)$/.test(g.name))) {
+      else if (g.type === T.ptr || (g.type === T.i32 && /(?:underlyingStore|underlyingBuckets|__Porffor_regex_cache|__Porffor_dataview_reinterpretTemp)$/.test(g.name))) {
         if (/underlyingStore$/.test(g.name)) {
           const buckets = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBuckets'));
           const bucketsCap = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBucketsCap'));
