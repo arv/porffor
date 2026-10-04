@@ -437,10 +437,14 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     return node.some(hasRawC);
   };
 
+  // an allocation, or a call that may hand back a raw heap pointer (builtins pass
+  // reactions, entries etc around as plain i32s)
   const hasAlloc = node => {
     if (!Array.isArray(node)) return false;
     if (isNode(node)) {
-      if (node[N_KIND] === K.Alloc) return true;
+      const k = node[N_KIND];
+      if (k === K.Alloc) return true;
+      if (k === K.Call && (node[N_TYPE] === T.i32 || node[N_TYPE] === T.u32 || node[N_TYPE] === T.ptr)) return true;
       return hasAlloc(node[N_A]) || hasAlloc(node[N_B]) || hasAlloc(node[N_C]);
     }
     return node.some(hasAlloc);
@@ -461,7 +465,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     for (const id of scratchIds(body)) emit(`  PORF_ROOT u32 porf_sa${id} = 0;\n`);
   };
 
-  // builtins keep raw allocations in i32 locals: those must be gc-visible too
+  // builtins keep raw heap pointers in i32 locals: those must be gc-visible too
   const allocLocals = (node, out = new Set()) => {
     if (!Array.isArray(node)) return out;
     if (isNode(node)) {
@@ -1361,7 +1365,11 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], entry = null, 
     activeTryDepth = 0;
     loopStack.length = 0;
     usedLabels = new Set();
-    for (const [n, t] of locals) emit(`  ${CT[t]} ${n}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
+    const allocd = new Set([ ...allocLocals(body) ].map(sanitize));
+    for (const [n, t] of locals) {
+      const q = allocd.has(n) && (t === T.i32 || t === T.u32) ? 'PORF_ROOT ' : rootQual(t);
+      emit(`  ${q}${CT[t]} ${n}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
+    }
     emitScratchSlots(body);
 
     const { pre, args } = invokeArgs(f, { env: 'porf_fr->env', thisv: 'porf_fr->thisv', newtv: 'porf_fr->newtv', callee: 'porf_fr->callee', argc: 'porf_fr->argc', argv: 'porf_coro_argv(porf_fr)',
@@ -1720,9 +1728,9 @@ ${st}jsval porf_async_call_sync(u32 idx, jsval callee, u32 env, jsval thisv, jsv
 	}
 
 static void porf_promise_run_coro_reaction_coro(PORF_ROOT u32 reaction) {
-  porf_coro_call* call = (porf_coro_call*)(MEM + (u32)*(u64*)(MEM + reaction + PORF_REACTION_HANDLER));
-  const jsval out_promise = porf_unpack(*(jsbits*)(MEM + reaction + PORF_REACTION_OUT_PROMISE));
-  const jsval value = porf_unpack(*(jsbits*)(MEM + reaction + PORF_REACTION_VALUE));
+  porf_coro_call* PORF_ROOT call = (porf_coro_call*)(MEM + (u32)*(u64*)(MEM + reaction + PORF_REACTION_HANDLER));
+  PORF_ROOT const jsval out_promise = porf_unpack(*(jsbits*)(MEM + reaction + PORF_REACTION_OUT_PROMISE));
+  PORF_ROOT const jsval value = porf_unpack(*(jsbits*)(MEM + reaction + PORF_REACTION_VALUE));
   const i32 is_throw = (i32)*(u32*)(MEM + reaction + PORF_REACTION_PAYLOAD);
 
   const i32 try_idx = porf_try_depth++;
@@ -1730,7 +1738,7 @@ static void porf_promise_run_coro_reaction_coro(PORF_ROOT u32 reaction) {
     const i32 done = porf_coro_call_step(call, value, is_throw);
     porf_try_depth = try_idx;
     if (done) {
-      const jsval result = call->result;
+      PORF_ROOT const jsval result = call->result;
       ${settleAsyncResult('result', 'out_promise')}
       return;
     }
@@ -1812,7 +1820,7 @@ ${st}jsval porf_coro_start(u8 flags, u32 idx, PORF_ROOT jsval callee, PORF_ROOT 
 
   if (kind == ${FN_GENERATOR} || kind == ${FN_ASYNC_GENERATOR}) {
     const u32 type = kind == ${FN_GENERATOR} ? ${TYPES.__porffor_generator}u : ${TYPES.__porffor_asyncgenerator}u;
-    porf_coro_call* call = porf_coro_alloc(type, frame, argc);
+    porf_coro_call* PORF_ROOT call = porf_coro_alloc(type, frame, argc);
     porf_coro_init(call, call->heap, frame, idx, callee, env, thisv, newtv, argc, argv);
     if (flags & ${FN_CORO_INIT}u) {
       const i32 try_idx = porf_try_depth++;
@@ -1830,18 +1838,18 @@ ${st}jsval porf_coro_start(u8 flags, u32 idx, PORF_ROOT jsval callee, PORF_ROOT 
 
   // record on the C stack until it first suspends
   const u32 bytes = PORF_CORO_BYTES(frame, argc);
-  porf_coro_call* call = bytes <= 1024u ? (porf_coro_call*)__builtin_alloca(bytes) : porf_coro_alloc(PORF_GC_KIND_CORO, frame, argc);
+  porf_coro_call* PORF_ROOT call = bytes <= 1024u ? (porf_coro_call*)__builtin_alloca(bytes) : porf_coro_alloc(PORF_GC_KIND_CORO, frame, argc);
   porf_coro_init(call, bytes <= 1024u ? 0 : call->heap, frame, idx, callee, env, thisv, newtv, argc, argv);
-  const jsval out_promise = porf_promise_pending();
+  PORF_ROOT const jsval out_promise = porf_promise_pending();
   const i32 try_idx = porf_try_depth++;
   if (_setjmp(porf_try_ensure()[try_idx]) == 0) {
     const i32 done = porf_coro_call_step(call, JV_UNDEFINED, 0);
     porf_try_depth = try_idx;
     if (done) {
-      jsval result = call->result;
+      PORF_ROOT jsval result = call->result;
       ${settleAsyncResult('result', 'out_promise')}
     } else {
-      porf_coro_call* heap = porf_coro_promote(call);
+      porf_coro_call* PORF_ROOT heap = porf_coro_promote(call);
       porf_promise_attach_coro(heap->channel, heap, out_promise);
     }
     return out_promise;
@@ -3842,11 +3850,19 @@ static void porf_gc_cons_candidate(u32 c) {
   porf_gc_cons_mark_block((i32)base);
 }
 static void porf_gc_cons_scan_range(const u64* lo, const u64* hi) {
+  // C helpers also hold native pointers (MEM + offset) into the arena
+  const uintptr_t mem = (uintptr_t)porf_mem;
   for (const u64* w = lo; w < hi; w++) {
     const u64 v = *w;
     if (v == 0) continue;
     porf_gc_cons_candidate((u32)v);
     porf_gc_cons_candidate((u32)(v >> 32));
+    if (sizeof(uintptr_t) == 8) {
+      if ((uintptr_t)v - mem < (uintptr_t)PORF_ARENA_RESERVE) porf_gc_cons_candidate((u32)((uintptr_t)v - mem));
+    } else {
+      if ((uintptr_t)(u32)v - mem < (uintptr_t)PORF_ARENA_RESERVE) porf_gc_cons_candidate((u32)((uintptr_t)(u32)v - mem));
+      if ((uintptr_t)(u32)(v >> 32) - mem < (uintptr_t)PORF_ARENA_RESERVE) porf_gc_cons_candidate((u32)((uintptr_t)(u32)(v >> 32) - mem));
+    }
     f64 d;
     memcpy(&d, w, 8);
     if (d > 0.0 && d < 4294967296.0) {
@@ -4958,10 +4974,10 @@ jsval ${iterClose}(jsval);
 
 // close the records a throw leaves, dropping errors from closing
 static void porf_iter_unwind(void) {
-  const jsval exception = porf_exception;
+  PORF_ROOT const jsval exception = porf_exception;
   while (porf_jv_type(porf_iter_open) != ${TYPES.undefined} &&
          porf_iter_base + (i32)porf_arr_get((u32)porf_iter_open.val, 5).val >= porf_try_depth) {
-    const jsval rec = porf_iter_open;
+    PORF_ROOT const jsval rec = porf_iter_open;
     porf_iter_open = porf_arr_get((u32)rec.val, 4);
     const i32 depth = porf_try_depth++;
     if (_setjmp(porf_try_ensure()[depth]) == 0) ${iterClose}(rec);
@@ -5337,7 +5353,7 @@ static void porf_promise_settle_direct(jsval promise, jsval value, i32 state) {
   porf_promise_trigger_reactions(reactions, value);
 }
 
-static u32 porf_promise_new_coro_reaction(porf_coro_call* call, PORF_ROOT jsval out_promise, i32 is_throw) {
+static u32 porf_promise_new_coro_reaction(porf_coro_call* PORF_ROOT call, PORF_ROOT jsval out_promise, i32 is_throw) {
   const u32 reaction = porf_alloc(PORF_REACTION_SIZE, 0);
   *(u64*)(MEM + reaction + PORF_REACTION_HANDLER) = (u64)call->heap;
   *(jsbits*)(MEM + reaction + PORF_REACTION_OUT_PROMISE) = porf_pack(out_promise);
@@ -5364,7 +5380,7 @@ static void porf_promise_append_raw_reaction(u32 promise, u32 reaction, i32 reje
   porf_gc_barrier(promise, ${TYPES.promise});
 }
 
-static void porf_promise_attach_coro(PORF_ROOT jsval awaited, porf_coro_call* call, PORF_ROOT jsval out_promise) {
+static void porf_promise_attach_coro(PORF_ROOT jsval awaited, porf_coro_call* PORF_ROOT call, PORF_ROOT jsval out_promise) {
   if (awaited.type != ${TYPES.promise}) porf_unreachable("coroutine awaited non-pending non-promise");
   const u32 p = (u32)awaited.val;
   *(u8*)(MEM + p + PORF_PROMISE_HANDLED) = 1;
@@ -5424,7 +5440,7 @@ static inline jsval porf_coro_received(porf_coro_call* c, i32 delegate) {
 }
 
 // 0 if v is a pending promise, else *v = its result
-static inline i32 porf_await_ready(jsval* v) {
+static inline i32 porf_await_ready(PORF_ROOT jsval* v) {
   if (porf_jv_type(*v) != ${TYPES.promise}) return 1;
   const u32 p = (u32)v->val;
   const u8 state = *(u8*)(MEM + p + PORF_PROMISE_STATE);
