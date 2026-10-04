@@ -1085,20 +1085,20 @@ const toAssignable = (node, isBinding, refDE) => {
 
     case 'Property':
       if (node.kind !== 'init') raise(node.key.start, "Object pattern can't contain getter or setter");
-      toAssignable(node.value, isBinding);
+      node.value = toAssignable(node.value, isBinding);
       break;
 
     case 'ArrayExpression':
       node.type = 'ArrayPattern';
       if (refDE) checkPatternErrors(refDE, true);
-      for (const elem of node.elements) {
-        if (elem !== null) toAssignable(elem, isBinding);
+      for (let i = 0; i < node.elements.length; i++) {
+        if (node.elements[i] !== null) node.elements[i] = toAssignable(node.elements[i], isBinding);
       }
       break;
 
     case 'SpreadElement':
       node.type = 'RestElement';
-      toAssignable(node.argument, isBinding);
+      node.argument = toAssignable(node.argument, isBinding);
       if (node.argument.type === 'AssignmentPattern') raise(node.argument.start, 'Rest elements cannot have a default value');
       break;
 
@@ -1106,12 +1106,16 @@ const toAssignable = (node, isBinding, refDE) => {
       if (node.operator !== '=') raise(node.left.end, "Only '=' operator can be used for specifying default value.");
       node.type = 'AssignmentPattern';
       node.operator = undefined;
-      toAssignable(node.left, isBinding);
+      node.left = toAssignable(node.left, isBinding);
       break;
 
     case 'MemberExpression':
       if (!isBinding) break;
       raise(node.start, 'Binding member expression');
+
+    case 'TSAsExpression':
+      // (x as T) = v assigns to x
+      if (!isBinding) return toAssignable(node.expression, isBinding, refDE);
 
     default:
       raise(node.start, (isBinding ? 'Binding' : 'Assigning to') + ' rvalue');
@@ -1145,12 +1149,13 @@ const checkLValSimple = (node, bindingType = 0) => {
       if (strict) raise(node.start, 'Assigning to rvalue');
       break;
 
-    case 'TSAsExpression': case 'TSSatisfiesExpression': case 'TSNonNullExpression':
+    case 'TSAsExpression':
       return checkLValSimple(node.expression, bindingType);
 
     default:
       raise(node.start, (isBind ? 'Binding' : 'Assigning to') + ' rvalue');
   }
+  return node;
 };
 
 const checkLValPattern = (node, bindingType = 0) => {
@@ -1322,7 +1327,7 @@ const parseMaybeAssign = (noIn, refDE, afterLeftParse) => {
       // annex-B web-compat call targets don't extend to logical assignment
       if (left.type === 'CallExpression' && (operator === '&&=' || operator === '||=' || operator === '??='))
         raise(left.start, 'Assigning to rvalue');
-      checkLValSimple(left);
+      left = checkLValSimple(left);
     }
     next();
     const right = parseMaybeAssign(noIn);
@@ -1362,7 +1367,7 @@ const parseExprOp = (left, leftStart, minPrec, noIn) => {
     let prec = tokPrec;
     if (tokKind === T_STARSTAR) prec = 0; // ** handled in parseMaybeUnary
     if (ts && !newlineBefore && minPrec < 8 && (isContextual('as') || isContextual('satisfies'))) {
-      left = tokValue === 'as' ? tsParseAs(left, leftStart) : tsParseSatisfies(left, leftStart);
+      left = tokValue === 'as' ? tsParseAs(left, leftStart) : tsParseSatisfies(left);
       continue;
     }
     if (prec <= 0 || prec <= minPrec) return left;
@@ -1402,10 +1407,10 @@ const parseMaybeUnary = (refDE, sawUnary, incDec, noIn) => {
     const update = tokKind === T_INCDEC;
     const isDelete = tokKind === T_DELETE;
     next();
-    const argument = parseMaybeUnary(null, true, update, noIn);
+    let argument = parseMaybeUnary(null, true, update, noIn);
     checkExpressionErrors(refDE, true);
     if (update) {
-      checkLValSimple(argument);
+      argument = checkLValSimple(argument);
     } else if (isDelete) {
       if (strict && argument.type === 'Identifier') raise(start, 'Deleting local variable in strict mode');
       if (isPrivateFieldAccess(argument)) raise(start, 'Private fields can not be deleted');
@@ -1426,8 +1431,7 @@ const parseMaybeUnary = (refDE, sawUnary, incDec, noIn) => {
     expr = parseExprSubscripts(refDE, noIn);
     if (checkExpressionErrors(refDE)) return expr;
     while (tokKind === T_INCDEC && !canInsertSemicolon()) {
-      checkLValSimple(expr);
-      expr = { type: 'UpdateExpression', start, end: tokEnd, operator: tokValue, prefix: false, argument: expr };
+      expr = { type: 'UpdateExpression', start, end: tokEnd, operator: tokValue, prefix: false, argument: checkLValSimple(expr) };
       next();
     }
   }
@@ -2665,13 +2669,13 @@ const parseForStatement = () => {
   const startsWithLet = isContextual('let');
   const refDE = newRefDE();
   const containsEsc = tokEsc;
-  const init = parseExpression(awaitAt > -1 ? 'await' : true, refDE);
+  let init = parseExpression(awaitAt > -1 ? 'await' : true, refDE);
   let isForOf = false;
   if (tokKind === T_IN || (isForOf = isContextual('of'))) {
     if (awaitAt > -1 && tokKind === T_IN) unexpected(awaitAt);
     if (startsWithLet && isForOf && !containsEsc)
       raise(init.start, "The left-hand side of a for-of loop may not start with 'let'");
-    if (!(init.type === 'CallExpression' && !strict)) toAssignable(init, false, refDE);
+    if (!(init.type === 'CallExpression' && !strict)) init = toAssignable(init, false, refDE);
     checkLValPattern(init);
     return parseForIn(start, init, awaitAt);
   }
@@ -4125,10 +4129,11 @@ const tsParseAs = (left, leftStart) => {
   return { type: 'TSAsExpression', start: leftStart, end: prevEnd, expression: left, typeAnnotation };
 };
 
-const tsParseSatisfies = (left, leftStart) => {
+// type-only, so erased like TS does
+const tsParseSatisfies = left => {
   next(); // satisfies
-  const typeAnnotation = tsParseType();
-  return { type: 'TSSatisfiesExpression', start: leftStart, end: prevEnd, expression: left, typeAnnotation };
+  tsParseType();
+  return left;
 };
 
 // tokens after 'f<T>' that keep it an instantiation (TS canFollowTypeArgumentsInExpression)
@@ -4146,11 +4151,12 @@ const tsCanFollowTypeArgs = () => {
   return false;
 };
 
-// TS in subscript position: x! and f<T> calls/instantiations
+// TS in subscript position: f<T> calls, and x! and f<T> which are type-only so erased like TS does
 const tsParseSubscript = (base, startPos, noCalls, optional, optionalChained, noIn) => {
   if (tokKind === T_PREFIX && tokValue === '!' && !newlineBefore) {
     next();
-    return { type: 'TSNonNullExpression', start: startPos, end: prevEnd, expression: base };
+    // returning base would end the subscript loop, so continue it here
+    return parseSubscript(base, startPos, noCalls, false, optionalChained, noIn);
   }
 
   if (tokKind === T_LT || (tokKind === T_BINOP && tokValue === '<<')) {
@@ -4174,7 +4180,7 @@ const tsParseSubscript = (base, startPos, noCalls, optional, optionalChained, no
       }
       if (optional) unexpected();
       if (!tsCanFollowTypeArgs()) unexpected(); // relational after all
-      return { type: 'TSInstantiationExpression', start: startPos, end: prevEnd, expression: base, typeParameters };
+      return base;
     });
     if (result) return result;
   }
@@ -4248,12 +4254,12 @@ const tsParseExprAtom = (refDE, noIn, canBeArrow) => {
   });
   if (arrow) return arrow;
 
-  // type assertion <T>expr
+  // type assertion <T>expr, the same as expr as T
   next(); // <
   const typeAnnotation = tsParseType();
   tsExpectGt();
   const expression = parseMaybeUnary(null, true, false, noIn);
-  return { type: 'TSTypeAssertion', start, end: prevEnd, typeAnnotation, expression };
+  return { type: 'TSAsExpression', start, end: prevEnd, expression, typeAnnotation };
 };
 
 const tsFinishOverloadSignature = node => {

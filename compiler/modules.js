@@ -181,7 +181,6 @@ const funcScopeNames = node => {
 };
 
 const SKIP_KEYS = new Set([ 'typeAnnotation', 'typeParameters', 'typeArguments', 'returnType', 'superTypeArguments', 'implements', 'start', 'end' ]);
-const TS_EXPR = new Set([ 'TSAsExpression', 'TSNonNullExpression', 'TSSatisfiesExpression', 'TSTypeAssertion', 'TSInstantiationExpression' ]);
 
 // side-effect free on evaluation, so droppable when unreferenced (src for @__PURE__ annotations)
 const PURE_NEW = new Set([ 'Map', 'Set', 'WeakMap', 'WeakSet', 'RegExp' ]);
@@ -541,7 +540,7 @@ export default (entrySource, entryFile, opts = {}) => {
 
         default:
           if (node.type.startsWith('TS')) {
-            if (TS_EXPR.has(node.type)) node.expression = walk(node.expression);
+            if (node.type === 'TSAsExpression') node.expression = walk(node.expression);
             return node;
           }
           return walkKeys(node);
