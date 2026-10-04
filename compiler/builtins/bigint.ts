@@ -26,9 +26,11 @@ export const __Porffor_bigint_fromDigits = (negative: boolean, digits: i32[]): b
   return (ptr + 0x8000000000000) as bigint;
 };
 
+// bigints with |n| < 2^41 are stored inline, larger ones on the heap as ptr + 2^51.
+// the inline limit is what fits in a jsbits payload (see porf_pack)
 export const __Porffor_bigint_fromNumber = (n: number): bigint => {
   if (!Number.isInteger(n) || !Number.isFinite(n)) throw new RangeError('Cannot use non-integer as BigInt');
-  if (Math.abs(n) < 0x8000000000000) return n as bigint;
+  if (Math.abs(n) < 0x20000000000) return n as bigint;
 
   const negative: boolean = n < 0;
   n = Math.abs(n);
@@ -108,7 +110,7 @@ export const __Porffor_bigint_fromString = (n: string|bytestring): bigint => {
     acc = acc * radix + digit;
   }
 
-  if (acc < 0x8000000000000) {
+  if (acc < 0x20000000000) {
     // inline if small enough
     if (negative) acc = -acc;
     return acc as bigint;

@@ -4125,7 +4125,9 @@ ${st}void porf_gc_collect(int minor) {
 
 // jsval encoding: f64 numbers are themselves, else 0xFFF8 (sign + quiet-NaN) << 48 |
 // type:8 << 43 | payload:32. hardware qNaN is 0x7FF8 (sign clear) so never collides,
-// sign-set NaNs from raw bytes are canonicalized at Float64Array/DataView reads (porf_canon)
+// sign-set NaNs from raw bytes are canonicalized at Float64Array/DataView reads (porf_canon).
+// bigints use all 43 payload bits: bit 42 set = heap (ptr in low 32 bits), else the inline
+// value as 42-bit two's complement (so inline bigints are limited to |n| < 2^41)
 const RUNTIME_HEAD = (prefs, toStr = null, iterClose = null) => {
   const st = 'static ';
   const sti = 'static inline ';
@@ -4212,6 +4214,7 @@ extern const u32 porf_static_end;
 #define JV_UNDEFINED_BITS (JV_PATTERN | ((u64)${TYPES.undefined} << 43))
 #define JV_UNDEFINED ((jsval){0.0, ${TYPES.undefined}})
 #define JV_ZERO_BITS (JV_PATTERN | ((u64)${TYPES.number} << 43))
+#define JV_BIGINT_HEAP 0x40000000000ull
 
 #define PORF_PROMISE_RESULT 0
 #define PORF_PROMISE_FULFILL_HEAD 8
@@ -4254,6 +4257,9 @@ static inline jsbits porf_pack(jsval v) {
     // negative quiet NaNs collide with the boxed encoding: canonicalize
     return (b & JV_PATTERN) == JV_PATTERN ? 0x7FF8000000000000ull : b;
   }
+  if (v.type == ${TYPES.bigint}) return JV_PATTERN | ((u64)${TYPES.bigint} << 43) | (v.val >= 2251799813685248.0
+    ? JV_BIGINT_HEAP | (u64)(u32)(v.val - 2251799813685248.0)
+    : (u64)(i64)v.val & (JV_BIGINT_HEAP - 1));
   return JV_PATTERN | ((u64)(v.type & 0xFF) << 43) | (u64)(u32)v.val;
 }
 ${sti}jsbits porf_arr_pack(jsval v) {
@@ -4262,7 +4268,11 @@ ${sti}jsbits porf_arr_pack(jsval v) {
 }
 static inline jsval porf_unpack(jsbits b) {
   if ((b & JV_PATTERN) != JV_PATTERN) return porf_box_num(porf_bits_to_f64(b));
-  return (jsval){(f64)(u32)b, (i32)((b >> 43) & 0xFF)};
+  const i32 type = (i32)((b >> 43) & 0xFF);
+  if (type == ${TYPES.bigint}) return (jsval){b & JV_BIGINT_HEAP
+    ? 2251799813685248.0 + (f64)(u32)b
+    : (f64)((i64)(b << 22) >> 22), type};
+  return (jsval){(f64)(u32)b, type};
 }
 static inline f64 porf_canon(f64 d) { return d == d ? d : porf_bits_to_f64(0x7FF8000000000000ull); }
 
