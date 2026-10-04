@@ -4823,15 +4823,17 @@ ${sti}i32 porf_loose_eq(jsval a, jsval b) {
     return a.val == 0.0 && ((u32)b.val == 0u || *(u32*)(MEM + (u32)b.val) == 0u);
   if (ta == ${TYPES.boolean}) return porf_loose_eq(porf_box_num((f64)(u32)a.val), b);
   if (tb == ${TYPES.boolean}) return porf_loose_eq(a, porf_box_num((f64)(u32)b.val));
+  if (ta == ${TYPES.bigint} && tb == ${TYPES.bigint}) return porf_bigint_cmp(a, b) == 0;
   return porf_jv_eq(a, b);
 }
 
-// === : numbers as f64, strings by content, else identity
+// === : numbers as f64, strings and bigints by content, else identity
 ${sti}i32 porf_strict_eq(jsval a, jsval b) {
   if (porf_jv_is_num(a)) return porf_jv_is_num(b) && a.val == b.val;
   const i32 ta = porf_jv_type(a), tb = porf_jv_type(b);
   if ((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && (tb == ${TYPES.bytestring} || tb == ${TYPES.string})) return porf_str_eq(a, b);
   if (ta != tb) return 0;
+  if (ta == ${TYPES.bigint}) return porf_bigint_cmp(a, b) == 0;
   return (u32)a.val == (u32)b.val;
 }
 
