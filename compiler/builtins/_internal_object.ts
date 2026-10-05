@@ -1,15 +1,16 @@
 import type {} from './porffor.d.ts';
 
 // __memory layout__
-// per object (16):
-//  size (u16, 2)
-//  capacity (u16, 2)
+// per object (24):
+//  shape (u64, 8): entries pointer (u32) | size (u16) << 32 | capacity (u16) << 48.
+//   always published in one store, and read in one load where entries are walked, so a
+//   reader racing a grow/delete on another thread never pairs a size with the wrong block
+//  prototype (jsbits, 8)
 //  root flags (u8, 1):
 //   inextensible - 0b0001
-//  prototype type (u8, 1)
-//  padding (u16, 2)
-//  prototype (u32, 4)
-//  entries pointer (u32, 4)
+//  padding (u8 x3, 3)
+//  lock (u32, 4): held by a thread adding/removing entries (no-op without threads)
+// entries start inline at +24 until the first grow
 // per entry (24):
 //  key - hash (u32, 4)
 //  key - value (u32, 4)
@@ -106,56 +107,162 @@ export const __Porffor_object_writeKey = (ptr: i32, key: any, hash: i32): void =
 };
 
 export const __Porffor_object_new = (capacity: i32 = 4): object => {
-  const obj: object = Porffor.malloc(16 + capacity * 24);
-  Porffor.IR.storeU16(obj, 0, 0);
-  Porffor.IR.storeU16(obj, 2, capacity);
-  Porffor.IR.storeU8(obj, 4, 0);
-  Porffor.IR.storeU8(obj, 5, 0);
-  Porffor.IR.storeI32(obj, 8, 0);
-  Porffor.IR.storeI32(obj, 12, Porffor.IR.ptr(obj) + 16);
+  const obj: object = Porffor.malloc(24 + capacity * 24);
+  const ptr: i32 = Porffor.IR.ptr(obj);
+  Porffor.c`porf_obj_publish((u32)ptr, PORF_OBJ_SHAPE((u32)ptr + 24u, 0u, capacity));`;
+  Porffor.IR.storeJv(obj, 8, undefined);
+  Porffor.IR.storeU8(obj, 16, 0);
+  Porffor.IR.storeI32(obj, 20, 0);
   return obj;
 };
 
 export const __Porffor_object_entriesPtr = (obj: any): i32 => {
-  return Porffor.IR.loadI32(obj, 12);
+  return Porffor.IR.loadI32(obj, 0);
 };
 
+export const __Porffor_object_size = (obj: any): i32 => {
+  return Porffor.IR.loadU16(obj, 4);
+};
+
+// grow so needed entries fit; caller holds the object lock
 export const __Porffor_object_ensureCapacity = (obj: any, needed: i32): i32 => {
-  let capacity: i32 = Porffor.IR.loadU16(obj, 2);
-  const entriesPtr: i32 = Porffor.IR.loadI32(obj, 12);
+  const o: i32 = Porffor.IR.ptr(obj);
+  let entriesPtr: i32 = 0;
+  let size: i32 = 0;
+  let capacity: i32 = 0;
+  Porffor.c`PORF_OBJ_SNAP3(o, entriesPtr, size, capacity);`;
   if (needed <= capacity) return entriesPtr;
 
   if (capacity == 0) capacity = 1;
   while (capacity < needed) capacity *= 2;
 
+  // copy, then publish: a reader still on the old block keeps a consistent view
   const newEntriesPtr: i32 = Porffor.malloc(capacity * 24);
-  const size: i32 = Porffor.IR.loadU16(obj, 0);
   if (size > 0) {
     Porffor.IR.copy(newEntriesPtr, entriesPtr, size * 24);
   }
 
-  Porffor.IR.storeU16(obj, 2, capacity);
-  Porffor.IR.storeI32(obj, 12, newEntriesPtr);
+  Porffor.c`porf_obj_publish((u32)o, PORF_OBJ_SHAPE(newEntriesPtr, size, capacity));`;
   Porffor.IR.gcBarrier(obj, Porffor.TYPES.object);
   return newEntriesPtr;
 };
 
-export const __Porffor_object_appendEntry = (obj: any, key: any, hash: i32): i32 => {
-  const size: i32 = Porffor.IR.loadU16(obj, 0);
-  const entriesPtr: i32 = __Porffor_object_ensureCapacity(obj, size + 1);
-  Porffor.IR.storeU16(obj, 0, size + 1);
-  const entryPtr: i32 = entriesPtr + size * 24;
-  __Porffor_object_writeKey(entryPtr, key, hash);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, key);
-  return entryPtr;
+// write flags and the value word (value, or the get/set pair when flags has the accessor
+// bit) of the entry for key, adding it when entryPtr is 0. seen is the state the caller
+// decided on: -1 no entry, -2 anything (an upsert), else the entry's flags.
+// with threads readers never lock, but every writer holds the object lock and finds its
+// entry again in the live block, since a grow or delete may have copied it away (a store
+// to the old block would be lost). when the entry no longer matches seen it returns 1 and
+// the caller starts over. an add publishes the size only once its entry is complete, and
+// switching between value and accessor copies the block, as readers pair flags with word
+export const __Porffor_object_commit = (obj: any, entryPtr: i32, key: any, hash: i32, seen: i32, flags: i32, value: any, get: any, set: any): i32 => {
+  const o: i32 = Porffor.IR.ptr(obj);
+  const getRaw: i32 = Porffor.IR.ptr(get);
+  const setRaw: i32 = Porffor.IR.ptr(set);
+  let threaded: i32 = 0;
+  Porffor.c`threaded = PORF_THREADED;
+porf_obj_lock((u32)o);`;
+
+  let entriesPtr: i32 = 0;
+  let size: i32 = 0;
+  let capacity: i32 = 0;
+  Porffor.c`PORF_OBJ_SNAP3(o, entriesPtr, size, capacity);`;
+  let copy: i32 = 0;
+  let added: i32 = 0;
+  if (threaded) {
+    let live: i32 = 0;
+    if (entryPtr >= entriesPtr) if (entryPtr < entriesPtr + size * 24) if ((entryPtr - entriesPtr) % 24 == 0)
+      if (Porffor.IR.loadI32(entryPtr, 0) == hash) if (Porffor.IR.loadI32(entryPtr, 4) == Porffor.IR.ptr(key))
+        if (Porffor.IR.loadU8(entryPtr, 18) == Porffor.type(key)) live = 1;
+    if (!live) entryPtr = __Porffor_object_lookup(obj, key, hash);
+
+    if (seen != -2) {
+      let stale: i32 = 0;
+      if (entryPtr == 0) {
+        stale = seen != -1;
+        // an add decided on before preventExtensions
+        if (seen == -1) if (Porffor.IR.loadU8(obj, 16) & 0b0001) stale = 1;
+      } else {
+        stale = Porffor.IR.loadU8(entryPtr, 16) != seen;
+      }
+
+      if (stale) {
+        Porffor.c`porf_obj_unlock((u32)o);`;
+        return 1;
+      }
+    }
+
+    if (entryPtr != 0) copy = (Porffor.IR.loadU8(entryPtr, 16) ^ flags) & 0b0001;
+  }
+
+  if (entryPtr == 0) {
+    entriesPtr = __Porffor_object_ensureCapacity(obj, size + 1);
+    Porffor.c`capacity = (i32)(u16)(porf_obj_snap((u32)o) >> 48);`;
+    entryPtr = entriesPtr + size * 24;
+    __Porffor_object_writeKey(entryPtr, key, hash);
+    size += 1;
+    added = 1;
+  } else if (copy) {
+    const newEntriesPtr: i32 = Porffor.malloc(capacity * 24);
+    Porffor.IR.copy(newEntriesPtr, entriesPtr, size * 24);
+    entryPtr = newEntriesPtr + (entryPtr - entriesPtr);
+    entriesPtr = newEntriesPtr;
+  }
+
+  Porffor.IR.storeU8(entryPtr, 16, flags);
+  Porffor.c`porf_obj_store_word((u32)entryPtr + 8u, (flags & 1) ? ((u64)(u32)getRaw | ((u64)(u32)setRaw << 32)) : porf_pack(value));`;
+  if (Porffor.fastOr(added, copy)) Porffor.c`porf_obj_publish((u32)o, PORF_OBJ_SHAPE(entriesPtr, size, capacity));`;
+  Porffor.c`porf_obj_unlock((u32)o);`;
+
+  if (added) Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, key);
+  if (copy) Porffor.IR.gcBarrier(obj, Porffor.TYPES.object);
+  if (flags & 0b0001) {
+    Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
+    Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
+  } else {
+    Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  }
+  return 0;
+};
+
+// drop the entry for key (at entryPtr when the caller just looked it up). with threads a
+// reader may be walking the entries right now, so build a new block and publish it
+// instead of shifting entries in place
+export const __Porffor_object_removeEntry = (obj: any, entryPtr: i32, key: any, hash: i32): void => {
+  const o: i32 = Porffor.IR.ptr(obj);
+  let threaded: i32 = 0;
+  Porffor.c`threaded = PORF_THREADED;
+porf_obj_lock((u32)o);`;
+  if (threaded) {
+    entryPtr = __Porffor_object_lookup(obj, key, hash);
+    if (entryPtr == 0) {
+      Porffor.c`porf_obj_unlock((u32)o);`;
+      return;
+    }
+  }
+
+  let entriesPtr: i32 = 0;
+  let size: i32 = 0;
+  let capacity: i32 = 0;
+  Porffor.c`PORF_OBJ_SNAP3(o, entriesPtr, size, capacity);`;
+  const ind: i32 = (entryPtr - entriesPtr) / 24;
+  const after: i32 = size - ind - 1;
+
+  if (threaded) {
+    const newEntriesPtr: i32 = Porffor.malloc(capacity * 24);
+    if (ind > 0) Porffor.IR.copy(newEntriesPtr, entriesPtr, ind * 24);
+    if (after > 0) Porffor.IR.copy(newEntriesPtr + ind * 24, entryPtr + 24, after * 24);
+    Porffor.c`porf_obj_publish((u32)o, PORF_OBJ_SHAPE(newEntriesPtr, size - 1, capacity));`;
+    Porffor.IR.gcBarrier(obj, Porffor.TYPES.object);
+  } else {
+    if (after > 0) Porffor.IR.copy(entryPtr, entryPtr + 24, after * 24);
+    Porffor.c`porf_obj_publish((u32)o, PORF_OBJ_SHAPE(entriesPtr, size - 1, capacity));`;
+  }
+  Porffor.c`porf_obj_unlock((u32)o);`;
 };
 
 export const __Porffor_object_fastAdd = (obj: any, key: any, value: any, flags: i32): void => {
-  const entryPtr: i32 = __Porffor_object_appendEntry(obj, key, __Porffor_object_hash(key));
-
-  Porffor.IR.storeJv(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  __Porffor_object_commit(obj, 0, key, __Porffor_object_hash(key), -2, flags, value, undefined, undefined);
 };
 
 export const __Porffor_object_readValue = (entryPtr: i32): any => {
@@ -328,7 +435,7 @@ export const __Porffor_object_underlyingLocked = (_obj: any): any => {
       }
 
       if (objType == Porffor.TYPES.string) {
-        Porffor.IR.storeU8(underlying, 4, 0b0001);
+        Porffor.IR.storeU8(underlying, 16, 0b0001);
       }
     }
 
@@ -341,7 +448,7 @@ export const __Porffor_object_underlyingLocked = (_obj: any): any => {
         __Porffor_object_fastAdd(underlying, Porffor.callThis(__Number_prototype_toString, i), (obj as bytestring)[i], 0b0100);
       }
 
-      Porffor.IR.storeU8(underlying, 4, 0b0001);
+      Porffor.IR.storeU8(underlying, 16, 0b0001);
     }
 
     if (Porffor.fastOr(underlyingBuckets == 0, (underlyingLength + 2) * 4 > underlyingBucketsCap * 3)) {
@@ -392,7 +499,11 @@ export const __Porffor_object_preventExtensions = (obj: any): void => {
     if (Porffor.type(obj) != Porffor.TYPES.object) return;
   }
 
-  Porffor.IR.storeU8(obj, 4, Porffor.IR.loadU8(obj, 4) | 0b0001);
+  // under the lock so an add in flight (which checks under it) is either before or rejected
+  const o: i32 = Porffor.IR.ptr(obj);
+  Porffor.c`porf_obj_lock((u32)o);`;
+  Porffor.IR.storeU8(obj, 16, Porffor.IR.loadU8(obj, 16) | 0b0001);
+  Porffor.c`porf_obj_unlock((u32)o);`;
 };
 
 export const __Porffor_object_isInextensible = (obj: any): boolean => {
@@ -401,7 +512,7 @@ export const __Porffor_object_isInextensible = (obj: any): boolean => {
     if (Porffor.type(obj) != Porffor.TYPES.object) return false;
   }
 
-  return (Porffor.IR.loadU8(obj, 4) & 0b0001) != 0;
+  return (Porffor.IR.loadU8(obj, 16) & 0b0001) != 0;
 };
 
 export const __Porffor_object_setPrototype = (obj: any, proto: any): void => {
@@ -411,8 +522,7 @@ export const __Porffor_object_setPrototype = (obj: any, proto: any): void => {
   }
 
   if (__Porffor_object_isObjectOrNull(proto)) {
-    Porffor.IR.storeI32(obj, 8, proto);
-    Porffor.IR.storeU8(obj, 5, Porffor.type(proto));
+    Porffor.IR.storeJv(obj, 8, proto);
     Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, proto);
   }
 };
@@ -425,7 +535,7 @@ export const __Porffor_object_getPrototype = (obj: any): any => {
     }
   }
 
-  return Porffor.as(Porffor.IR.loadI32(obj, 8), Porffor.IR.loadU8(obj, 5));
+  return Porffor.IR.loadJv(obj, 8);
 };
 
 export const __Porffor_object_getPrototypeWithHidden = (obj: any, trueType: i32): any => {
@@ -442,8 +552,12 @@ export const __Porffor_object_overrideAllFlags = (obj: any, overrideOr: i32, ove
     if (Porffor.type(obj) != Porffor.TYPES.object) return;
   }
 
-  let ptr: i32 = __Porffor_object_entriesPtr(obj);
-  const size: i32 = Porffor.IR.loadU16(obj, 0);
+  const o: i32 = Porffor.IR.ptr(obj);
+  let ptr: i32 = 0;
+  let size: i32 = 0;
+  // under the lock: writers check the flags they decided on under it, and the block is live
+  Porffor.c`porf_obj_lock((u32)o);`;
+  Porffor.c`PORF_OBJ_SNAP(o, ptr, size);`;
   const endPtr: i32 = ptr + size * 24;
 
   for (; ptr < endPtr; ptr += 24) {
@@ -451,6 +565,7 @@ export const __Porffor_object_overrideAllFlags = (obj: any, overrideOr: i32, ove
     flags = (flags | overrideOr) & overrideAnd;
     Porffor.IR.storeU8(ptr, 16, flags);
   }
+  Porffor.c`porf_obj_unlock((u32)o);`;
 };
 
 export const __Porffor_object_checkAllFlags = (obj: any, dataAnd: i32, accessorAnd: i32, dataExpected: i32, accessorExpected: i32): boolean => {
@@ -459,8 +574,10 @@ export const __Porffor_object_checkAllFlags = (obj: any, dataAnd: i32, accessorA
     if (Porffor.type(obj) != Porffor.TYPES.object) return false;
   }
 
-  let ptr: i32 = __Porffor_object_entriesPtr(obj);
-  const size: i32 = Porffor.IR.loadU16(obj, 0);
+  const o: i32 = Porffor.IR.ptr(obj);
+  let ptr: i32 = 0;
+  let size: i32 = 0;
+  Porffor.c`PORF_OBJ_SNAP(o, ptr, size);`;
   const endPtr: i32 = ptr + size * 24;
 
   for (; ptr < endPtr; ptr += 24) {
@@ -492,16 +609,14 @@ export const __Porffor_object_accessorSet = (entryPtr: i32): Function|undefined 
   return out;
 };
 
-export const __Porffor_object_writeAccessor = (entryPtr: i32, get: i32, set: i32): void => {
-  Porffor.IR.storeI32(entryPtr, 8, get);
-  Porffor.IR.storeI32(entryPtr, 12, set);
-};
-
 export const __Porffor_object_lookup = (obj: any, target: any, targetHash: i32): i32 => {
   if (Porffor.IR.ptr(obj) == 0) return 0;
 
-  let ptr: i32 = __Porffor_object_entriesPtr(obj);
-  const endPtr: i32 = ptr + Porffor.IR.loadU16(obj, 0) * 24;
+  const o: i32 = Porffor.IR.ptr(obj);
+  let ptr: i32 = 0;
+  let size: i32 = 0;
+  Porffor.c`PORF_OBJ_SNAP(o, ptr, size);`;
+  const endPtr: i32 = ptr + size * 24;
 
   if (Porffor.comptime.flag`hasType.symbol`) {
     if (Porffor.type(target) == Porffor.TYPES.symbol) {
@@ -624,8 +739,12 @@ export const __Porffor_object_get_ic = (_obj: any, key: any, hash: i32, slot: i3
   if (Porffor.type(_obj) == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(_obj) != 0) {
       const off: i32 = Porffor.IR.loadI32(slot, 0);
-      if (off < Porffor.IR.loadU16(_obj, 0) * 24) {
-        const entryPtr: i32 = Porffor.IR.loadI32(_obj, 12) + off;
+      const o: i32 = Porffor.IR.ptr(_obj);
+      let entriesPtr: i32 = 0;
+      let size: i32 = 0;
+      Porffor.c`PORF_OBJ_SNAP(o, entriesPtr, size);`;
+      if (off < size * 24) {
+        const entryPtr: i32 = entriesPtr + off;
         if (Porffor.IR.loadI32(entryPtr, 0) == hash) {
           if ((Porffor.IR.loadU16(entryPtr, 16) & 0b0001) == 0) return __Porffor_object_readValue(entryPtr);
         }
@@ -639,9 +758,12 @@ export const __Porffor_object_get_ic = (_obj: any, key: any, hash: i32, slot: i3
 export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot: i32): any => {
   if (Porffor.type(_obj) == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(_obj) != 0) {
-      const entriesPtr: i32 = Porffor.IR.loadI32(_obj, 12);
+      const o: i32 = Porffor.IR.ptr(_obj);
+      let entriesPtr: i32 = 0;
+      let size: i32 = 0;
+      Porffor.c`PORF_OBJ_SNAP(o, entriesPtr, size);`;
       let ptr: i32 = entriesPtr;
-      const endPtr: i32 = ptr + Porffor.IR.loadU16(_obj, 0) * 24;
+      const endPtr: i32 = ptr + size * 24;
       for (; ptr < endPtr; ptr += 24) {
         if (Porffor.IR.loadI32(ptr, 0) == hash) {
           // first writer wins so polymorphic sites miss instead of storing each time
@@ -790,7 +912,7 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
       return value;
     }
 
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
+    entryPtr = 0;
 
     // flags = writable, enumerable, configurable, not accessor
     flags = 0b1110;
@@ -817,10 +939,17 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
     flags = tail & 0xff;
   }
 
-  Porffor.IR.storeJv(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  // without threads nothing can move an existing entry, so write it in place
+  let threaded: i32 = 0;
+  Porffor.c`threaded = PORF_THREADED;`;
+  if (Porffor.fastOr(threaded, entryPtr == 0)) {
+    if (__Porffor_object_commit(obj, entryPtr, key, hash, entryPtr == 0 ? -1 : flags, flags, value, undefined, undefined)) return __Porffor_object_set(_obj, key, value);
+    return value;
+  }
 
+  Porffor.IR.storeU8(entryPtr, 16, flags);
+  Porffor.IR.storeJv(entryPtr, 8, value);
+  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
   return value;
 };
 
@@ -877,7 +1006,7 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
       return value;
     }
 
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
+    entryPtr = 0;
 
     // flags = writable, enumerable, configurable, not accessor
     flags = 0b1110;
@@ -904,10 +1033,17 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
     flags = tail & 0xff;
   }
 
-  Porffor.IR.storeJv(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  // without threads nothing can move an existing entry, so write it in place
+  let threaded: i32 = 0;
+  Porffor.c`threaded = PORF_THREADED;`;
+  if (Porffor.fastOr(threaded, entryPtr == 0)) {
+    if (__Porffor_object_commit(obj, entryPtr, key, hash, entryPtr == 0 ? -1 : flags, flags, value, undefined, undefined)) return __Porffor_object_set_withHash(_obj, key, value, hash);
+    return value;
+  }
 
+  Porffor.IR.storeU8(entryPtr, 16, flags);
+  Porffor.IR.storeJv(entryPtr, 8, value);
+  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
   return value;
 };
 
@@ -992,7 +1128,7 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
       throw new TypeError('Cannot add property to inextensible object');
     }
 
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
+    entryPtr = 0;
 
     // flags = writable, enumerable, configurable, not accessor
     flags = 0b1110;
@@ -1019,10 +1155,17 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
     flags = tail & 0xff;
   }
 
-  Porffor.IR.storeJv(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  // without threads nothing can move an existing entry, so write it in place
+  let threaded: i32 = 0;
+  Porffor.c`threaded = PORF_THREADED;`;
+  if (Porffor.fastOr(threaded, entryPtr == 0)) {
+    if (__Porffor_object_commit(obj, entryPtr, key, hash, entryPtr == 0 ? -1 : flags, flags, value, undefined, undefined)) return __Porffor_object_setStrict(_obj, key, value);
+    return value;
+  }
 
+  Porffor.IR.storeU8(entryPtr, 16, flags);
+  Porffor.IR.storeJv(entryPtr, 8, value);
+  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
   return value;
 };
 
@@ -1080,7 +1223,7 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
       throw new TypeError('Cannot add property to inextensible object');
     }
 
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
+    entryPtr = 0;
 
     // flags = writable, enumerable, configurable, not accessor
     flags = 0b1110;
@@ -1107,10 +1250,17 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
     flags = tail & 0xff;
   }
 
-  Porffor.IR.storeJv(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  // without threads nothing can move an existing entry, so write it in place
+  let threaded: i32 = 0;
+  Porffor.c`threaded = PORF_THREADED;`;
+  if (Porffor.fastOr(threaded, entryPtr == 0)) {
+    if (__Porffor_object_commit(obj, entryPtr, key, hash, entryPtr == 0 ? -1 : flags, flags, value, undefined, undefined)) return __Porffor_object_setStrict_withHash(_obj, key, value, hash);
+    return value;
+  }
 
+  Porffor.IR.storeU8(entryPtr, 16, flags);
+  Porffor.IR.storeJv(entryPtr, 8, value);
+  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
   return value;
 };
 
@@ -1122,17 +1272,17 @@ export const __Porffor_object_define = (obj: any, key: any, value: any, flags: i
 
   const hash: i32 = __Porffor_object_hash(key);
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
+  let seen: i32 = -1;
   if (entryPtr == 0) {
     // add new entry
     // check if object is inextensible
     if (__Porffor_object_isInextensible(obj)) {
       throw new TypeError('Cannot define property, object is inextensible');
     }
-
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   } else {
     // existing entry, check and maybe modify it
     const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+    seen = tail & 0xff;
 
     if ((tail & 0b0010) == 0) {
       // not already configurable, check to see if we can redefine
@@ -1156,9 +1306,7 @@ export const __Porffor_object_define = (obj: any, key: any, value: any, flags: i
     }
   }
 
-  Porffor.IR.storeJv(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  if (__Porffor_object_commit(obj, entryPtr, key, hash, seen, flags, value, undefined, undefined)) __Porffor_object_define(obj, key, value, flags);
 };
 
 export const __Porffor_object_defineAccessor = (obj: any, key: any, get: any, set: any, flags: i32): void => {
@@ -1169,6 +1317,7 @@ export const __Porffor_object_defineAccessor = (obj: any, key: any, get: any, se
 
   const hash: i32 = __Porffor_object_hash(key);
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
+  let seen: i32 = -1;
   const getRaw: i32 = Porffor.IR.ptr(get);
   const setRaw: i32 = Porffor.IR.ptr(set);
 
@@ -1178,11 +1327,10 @@ export const __Porffor_object_defineAccessor = (obj: any, key: any, get: any, se
     if (__Porffor_object_isInextensible(obj)) {
       throw new TypeError('Cannot define property, object is inextensible');
     }
-
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   } else {
     // existing entry, check and maybe modify it
     const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
+    seen = tail & 0xff;
 
     if ((tail & 0b0010) == 0) {
       // not already configurable, check to see if we can redefine
@@ -1202,11 +1350,7 @@ export const __Porffor_object_defineAccessor = (obj: any, key: any, get: any, se
     }
   }
 
-  __Porffor_object_writeAccessor(entryPtr, getRaw, setRaw);
-
-  Porffor.IR.storeU8(entryPtr, 16, flags);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
+  if (__Porffor_object_commit(obj, entryPtr, key, hash, seen, flags, undefined, get, set)) __Porffor_object_defineAccessor(obj, key, get, set, flags);
 };
 
 export const __Porffor_object_delete = (obj: any, key: any): boolean => {
@@ -1238,16 +1382,7 @@ export const __Porffor_object_delete = (obj: any, key: any): boolean => {
     return false;
   }
 
-  const ind: i32 = (entryPtr - __Porffor_object_entriesPtr(obj)) / 24;
-
-  // decrement size
-  let size: i32 = Porffor.IR.loadU16(obj, 0);
-  Porffor.IR.storeU16(obj, 0, --size);
-
-  if (size > ind) {
-    Porffor.IR.copy(entryPtr, entryPtr + 24, (size - ind) * 24);
-  }
-
+  __Porffor_object_removeEntry(obj, entryPtr, key, __Porffor_object_hash(key));
   return true;
 };
 
@@ -1280,16 +1415,7 @@ export const __Porffor_object_deleteStrict = (obj: any, key: any): boolean => {
     throw new TypeError('Cannot delete non-configurable property of object');
   }
 
-  const ind: i32 = (entryPtr - __Porffor_object_entriesPtr(obj)) / 24;
-
-  // decrement size
-  let size: i32 = Porffor.IR.loadU16(obj, 0);
-  Porffor.IR.storeU16(obj, 0, --size);
-
-  if (size > ind) {
-    Porffor.IR.copy(entryPtr, entryPtr + 24, (size - ind) * 24);
-  }
-
+  __Porffor_object_removeEntry(obj, entryPtr, key, __Porffor_object_hash(key));
   return true;
 };
 
@@ -1312,13 +1438,9 @@ export const __Porffor_object_expr_init = (obj: any, key: any, value: any): void
       return value;
     }
 
-    // add new entry
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   }
 
-  Porffor.IR.storeJv(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, 0b1110);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  __Porffor_object_commit(obj, entryPtr, key, hash, -2, 0b1110, value, undefined, undefined);
 };
 
 // used for { get foo() {} }
@@ -1329,20 +1451,13 @@ export const __Porffor_object_expr_get = (obj: any, key: any, get: any): void =>
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   let set: any = undefined;
   if (entryPtr == 0) {
-    // add new entry
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   } else if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
     // existing entry, keep set (if exists)
     set = __Porffor_object_accessorSet(entryPtr);
   }
 
-  // write new accessor pair
-  __Porffor_object_writeAccessor(entryPtr, get, set);
-
-  // flags = writable, enumerable, configurable, accessor
-  Porffor.IR.storeU8(entryPtr, 16, 0b1111);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
+  // write new accessor pair, flags = writable, enumerable, configurable, accessor
+  __Porffor_object_commit(obj, entryPtr, key, hash, -2, 0b1111, undefined, get, set);
 };
 
 // used for { set foo(v) {} }
@@ -1353,20 +1468,13 @@ export const __Porffor_object_expr_set = (obj: any, key: any, set: any): void =>
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   let get: any = undefined;
   if (entryPtr == 0) {
-    // add new entry
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   } else if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
     // existing entry, keep get (if exists)
     get = __Porffor_object_accessorGet(entryPtr);
   }
 
-  // write new accessor pair
-  __Porffor_object_writeAccessor(entryPtr, get, set);
-
-  // flags = writable, enumerable, configurable, accessor
-  Porffor.IR.storeU8(entryPtr, 16, 0b1111);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
+  // write new accessor pair, flags = writable, enumerable, configurable, accessor
+  __Porffor_object_commit(obj, entryPtr, key, hash, -2, 0b1111, undefined, get, set);
 };
 
 
@@ -1382,13 +1490,9 @@ export const __Porffor_object_class_value = (obj: any, key: any, value: any): vo
     if (__Porffor_object_isInextensible(obj)) {
       throw new TypeError('Cannot define property, object is inextensible');
     }
-
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   }
 
-  Porffor.IR.storeJv(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, 0b1110);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  __Porffor_object_commit(obj, entryPtr, key, hash, -2, 0b1110, value, undefined, undefined);
 };
 
 // used for { foo() {} }
@@ -1403,13 +1507,9 @@ export const __Porffor_object_class_method = (obj: any, key: any, value: any): v
     if (__Porffor_object_isInextensible(obj)) {
       throw new TypeError('Cannot define property, object is inextensible');
     }
-
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   }
 
-  Porffor.IR.storeJv(entryPtr, 8, value);
-  Porffor.IR.storeU8(entryPtr, 16, 0b1010);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+  __Porffor_object_commit(obj, entryPtr, key, hash, -2, 0b1010, value, undefined, undefined);
 };
 
 // used for { get foo() {} }
@@ -1425,20 +1525,13 @@ export const __Porffor_object_class_get = (obj: any, key: any, get: any): void =
     if (__Porffor_object_isInextensible(obj)) {
       throw new TypeError('Cannot define property, object is inextensible');
     }
-
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   } else if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
     // existing entry, keep set (if exists)
     set = __Porffor_object_accessorSet(entryPtr);
   }
 
-  // write new accessor pair
-  __Porffor_object_writeAccessor(entryPtr, get, set);
-
-  // flags = writable, enumerable, configurable, accessor
-  Porffor.IR.storeU8(entryPtr, 16, 0b1011);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
+  // write new accessor pair, flags = writable, enumerable, configurable, accessor
+  __Porffor_object_commit(obj, entryPtr, key, hash, -2, 0b1011, undefined, get, set);
 };
 
 // used for { set foo(v) {} }
@@ -1454,18 +1547,11 @@ export const __Porffor_object_class_set = (obj: any, key: any, set: any): void =
     if (__Porffor_object_isInextensible(obj)) {
       throw new TypeError('Cannot define property, object is inextensible');
     }
-
-    entryPtr = __Porffor_object_appendEntry(obj, key, hash);
   } else if (Porffor.IR.loadU8(entryPtr, 16) & 0b0001) {
     // existing entry, keep get (if exists)
     get = __Porffor_object_accessorGet(entryPtr);
   }
 
-  // write new accessor pair
-  __Porffor_object_writeAccessor(entryPtr, get, set);
-
-  // flags = writable, enumerable, configurable, accessor
-  Porffor.IR.storeU8(entryPtr, 16, 0b1011);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, get);
-  Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, set);
+  // write new accessor pair, flags = writable, enumerable, configurable, accessor
+  __Porffor_object_commit(obj, entryPtr, key, hash, -2, 0b1011, undefined, get, set);
 };

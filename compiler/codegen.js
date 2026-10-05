@@ -3662,8 +3662,10 @@ const generateForIn = (scope, decl) => {
       const length = tmp(scope, T.i32);
       const objPtr = reuse(scope, JvPtr(Local(objName, T.jsval)));
       assign(scope, counter, Const(T.i32, 0));
-      assign(scope, length, Load('u16', objPtr, 0));
-      assign(scope, pointer, Load('u32', objPtr, 12));
+      // one load of the shape word: entries pointer and size from the same moment
+      const shape = reuse(scope, Load('u64', objPtr, 0));
+      assign(scope, length, Convert(T.i32, Bin('&', T.i64, Bin('>>', T.i64, shape, Const(T.i64, 32)), Const(T.i64, 0xffff))));
+      assign(scope, pointer, Convert(T.u32, Bin('&', T.i64, shape, Const(T.i64, 0xffffffff))));
 
       const L = fresh(scope), C = fresh(scope);
       const d = { type: 'forin', brk: L, cont: C, contViaBreak: true };
@@ -4110,13 +4112,13 @@ const generateObject = (scope, decl) => {
       keys.add(key.value);
       const prop = reuse(scope, generate(scope, key));
       const val = reuse(scope, coerceValue(generate(scope, value), T.jsval));
-      const entries = Load('u32', JvPtr(obj), 12);
+      const entries = Load('u32', JvPtr(obj), 0);
       stmt(scope, Store('i32', entries, slot * 24, Const(T.i32, hash)));
       stmt(scope, Store('u32', entries, slot * 24 + 4, JvPtr(prop)));
       stmt(scope, Store('jsval', entries, slot * 24 + 8, val));
       stmt(scope, Store('u8', entries, slot * 24 + 16, Const(T.i32, 14)));
       stmt(scope, Store('u8', entries, slot * 24 + 18, JvType(prop)));
-      stmt(scope, Store('u16', JvPtr(obj), 0, Const(T.i32, ++slot)));
+      stmt(scope, Store('u16', JvPtr(obj), 4, Const(T.i32, ++slot)));
       stmt(scope, If(canReferenceCheck(scope, val), [ GcBarrier(JvPtr(obj), Const(T.i32, TYPES.object)) ]));
     } else {
       slot = -1;

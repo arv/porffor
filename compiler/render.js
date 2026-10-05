@@ -3014,28 +3014,28 @@ static inline i32 porf_gc_value_body(f64 value, i32 type) {
 static int porf_gc_object_shape_valid(i32 body) {
   if (!porf_gc_is_block_start(body)) return 0;
   const u32 block_size = porf_gc_block_size(body);
-  if (block_size < 16u) return 0;
-  const u32 size = *(u16*)(MEM + body);
-  const u32 capacity = *(u16*)(MEM + body + 2);
+  if (block_size < PORF_OBJ_HDR) return 0;
+  const u32 size = *(u16*)(MEM + body + 4);
+  const u32 capacity = *(u16*)(MEM + body + 6);
   if (size > capacity) return 0;
-  const i32 entries = *(u32*)(MEM + body + 12);
+  const i32 entries = *(u32*)(MEM + body);
   if (entries == 0) return size == 0;
   const u64 entry_bytes = (u64)capacity * 24ull;
-  if (entries == body + 16) return 16ull + entry_bytes <= (u64)block_size;
+  if (entries == body + PORF_OBJ_HDR) return PORF_OBJ_HDR + entry_bytes <= (u64)block_size;
   if (porf_gc_in_static(entries)) return porf_gc_static_range(entries, entry_bytes);
   if (!porf_gc_is_block_start(entries)) return 0;
   return entry_bytes <= (u64)porf_gc_block_size(entries);
 }
 
 static int porf_gc_static_object_shape_valid(i32 body) {
-  if (!porf_gc_static_range(body, 16ull)) return 0;
-  const u32 size = *(u16*)(MEM + body);
-  const u32 capacity = *(u16*)(MEM + body + 2);
+  if (!porf_gc_static_range(body, PORF_OBJ_HDR)) return 0;
+  const u32 size = *(u16*)(MEM + body + 4);
+  const u32 capacity = *(u16*)(MEM + body + 6);
   if (size > capacity) return 0;
-  const i32 entries = *(u32*)(MEM + body + 12);
+  const i32 entries = *(u32*)(MEM + body);
   if (entries == 0) return size == 0;
   const u64 entry_bytes = (u64)capacity * 24ull;
-  if (entries == body + 16) return porf_gc_static_range(body, 16ull + entry_bytes);
+  if (entries == body + PORF_OBJ_HDR) return porf_gc_static_range(body, PORF_OBJ_HDR + entry_bytes);
   if (porf_gc_in_static(entries)) return porf_gc_static_range(entries, entry_bytes);
   if (!porf_gc_is_block_start(entries)) return 0;
   return entry_bytes <= (u64)porf_gc_block_size(entries);
@@ -3395,14 +3395,13 @@ static void porf_gc_scan_body(i32 body, i32 type) {
       break;
     }
     case ${TYPES.object}: {
-      const i32 proto = *(u32*)(MEM + body + 8);
-      const i32 proto_type = *(u8*)(MEM + body + 5);
-      if (proto != 0 || proto_type != ${TYPES.undefined}) porf_gc_mark_js((f64)proto, proto_type);
-      u32 size = *(u16*)(MEM + body);
-      const i32 entries = *(u32*)(MEM + body + 12);
+      const jsval proto = porf_unpack(*(jsbits*)(MEM + body + 8));
+      if (porf_gc_type_can_reference(proto.type)) porf_gc_mark_js(proto.val, proto.type);
+      u32 size = *(u16*)(MEM + body + 4);
+      const i32 entries = *(u32*)(MEM + body);
       if (entries != 0) {
         porf_gc_mark_body(entries);
-        if (entries != body + 16) {
+        if (entries != body + PORF_OBJ_HDR) {
           porf_gc_set_kind(entries, PORF_GC_KIND_OBJECT_ENTRIES);
           if (porf_gc_is_block_start(entries)) {
             const u32 max_size = porf_gc_block_size(entries) / 24u;
@@ -4984,6 +4983,41 @@ PORF_NORETURN ${st}void porf_unreachable(const char* msg) {
   abort();
 }
 
+// object: [shape u64 @0 = entries u32 | size u16 << 32 | capacity u16 << 48][proto jsbits @8]
+//         [flags u8 @16][lock u32 @20], entries inline from @24 until the first grow.
+// the shape word is published in one store and walked from one load, so a racing reader
+// never pairs a size with the wrong entries block (see _internal_object.ts)
+#define PORF_OBJ_HDR 24u
+#define PORF_THREADED ${threads ? 1 : 0}
+#define PORF_OBJ_SHAPE(ent, size, cap) ((u64)(u32)(ent) | ((u64)(u16)(size) << 32) | ((u64)(u16)(cap) << 48))
+#define PORF_OBJ_SNAP(o, ent, size) do { const u64 porf_s_ = porf_obj_snap((u32)(o)); (ent) = (i32)(u32)porf_s_; (size) = (i32)(u16)(porf_s_ >> 32); } while (0)
+#define PORF_OBJ_SNAP3(o, ent, size, cap) do { const u64 porf_s_ = porf_obj_snap((u32)(o)); (ent) = (i32)(u32)porf_s_; (size) = (i32)(u16)(porf_s_ >> 32); (cap) = (i32)(u16)(porf_s_ >> 48); } while (0)
+${threads ? `static inline u64 porf_obj_snap(u32 o) { return __atomic_load_n((u64*)(MEM + o), __ATOMIC_ACQUIRE); }
+static inline void porf_obj_publish(u32 o, u64 shape) { __atomic_store_n((u64*)(MEM + o), shape, __ATOMIC_RELEASE); }
+static inline void porf_obj_store_word(u32 p, u64 w) { __atomic_store_n((u64*)(MEM + p), w, __ATOMIC_RELAXED); }
+// held by every writer (see __Porffor_object_commit): a short spin, parking for collections
+// while waiting (the holder may be stopped at a safepoint while it allocates)
+static PORF_NOINLINE void porf_obj_lock_slow(u32* l) {
+  for (;;) {
+    PORF_SAFEPOINT();
+    u32 z = 0;
+    if (__atomic_load_n(l, __ATOMIC_RELAXED) == 0 &&
+      __atomic_compare_exchange_n(l, &z, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    sched_yield();
+  }
+}
+static inline void porf_obj_lock(u32 o) {
+  u32* l = (u32*)(MEM + o + 20);
+  u32 z = 0;
+  if (__builtin_expect(!__atomic_compare_exchange_n(l, &z, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED), 0)) porf_obj_lock_slow(l);
+}
+static inline void porf_obj_unlock(u32 o) { __atomic_store_n((u32*)(MEM + o + 20), 0u, __ATOMIC_RELEASE); }
+` : `static inline u64 porf_obj_snap(u32 o) { return *(u64*)(MEM + o); }
+static inline void porf_obj_publish(u32 o, u64 shape) { *(u64*)(MEM + o) = shape; }
+static inline void porf_obj_store_word(u32 p, u64 w) { *(u64*)(MEM + p) = w; }
+#define porf_obj_lock(o) ((void)0)
+#define porf_obj_unlock(o) ((void)0)
+`}
 ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 
 // ---- core layouts ----
