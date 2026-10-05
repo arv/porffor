@@ -632,7 +632,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
           if (ctype === 'jsval') return [`porf_unpack(porf_load_un_u64(${addr}))`, P_POSTFIX];
           return [`porf_load_un_${ctype}(${addr})`, P_POSTFIX];
         }
-        if (ctype === 'jsval') return [`porf_unpack(*(jsbits*)(${addr}))`, P_POSTFIX];
+        if (ctype === 'jsval') return [`porf_unpack(porf_ld_bits(${addr}))`, P_POSTFIX];
         return [`*(${ctype === 'i8' ? 'int8_t' : ctype === 'i16' ? 'int16_t' : ctype}*)(${addr})`, P_UNARY];
       }
 
@@ -722,7 +722,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
         if (unaligned) {
           const un = { i16: 'u16', i32: 'u32', i64: 'u64', jsval: 'u64' }[ctype] ?? ctype;
           emit(`${ind()}porf_store_un_${un}(${addr}, ${ctype === 'jsval' ? packArg(value) : rx(value, P_COMMA)});\n`);
-        } else if (ctype === 'jsval') emit(`${ind()}*(jsbits*)(${addr}) = ${packArg(value)};\n`);
+        } else if (ctype === 'jsval') emit(`${ind()}porf_st_bits(${addr}, ${packArg(value)});\n`);
           else emit(`${ind()}*(${ctype === 'i8' ? 'int8_t' : ctype === 'i16' ? 'int16_t' : ctype}*)(${addr}) = ${rx(value, P_COMMA)};\n`);
         return;
       }
@@ -1755,7 +1755,7 @@ ${st}jsval porf_async_call_sync(u32 idx, jsval callee, u32 env, jsval thisv, jsv
 	  if (cap < len) cap = len;
 	  if (cap < 4) cap = 4;
 	  const u32 a = porf_alloc(16 + ((u32)cap << 3), type);
-	  PORF_ARR_LEN(a) = len; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap;
+	  PORF_ARR_LEN(a) = len; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap; *(u32*)(MEM + a + 12) = 0;
 	  memset(MEM + PORF_ARR_ENT(a), 0, (size_t)cap << 3);
 	  return a;
 	}
@@ -1914,8 +1914,11 @@ ${st}jsval porf_coro_start(u8 flags, u32 idx, PORF_ROOT jsval callee, PORF_ROOT 
 // spread calls use array iteration semantics: holes become present undefined values.
 ${st}jsval porf_call_dynamic_arr(jsval fn, jsval thisv, jsval newtv, jsval arr) {
   const u32 a = (u32)arr.val;
-  const i32 argc = PORF_ARR_LEN(a);
-  jsbits* argv = (jsbits*)(MEM + PORF_ARR_ENT(a));
+  u32 ent, cap;
+  PORF_ARR_VIEW(a, ent, cap);
+  const i32 len = PORF_ARR_LEN_LOAD(a);
+  const i32 argc = (u32)len < cap ? len : (i32)cap;
+  jsbits* argv = (jsbits*)(MEM + ent);
   for (i32 i = 0; i < argc; i++) {
     if (argv[i] == 0) {
       jsbits* dense = argc > 0 ? (jsbits*)malloc((size_t)argc * sizeof(jsbits)) : NULL;
@@ -2509,7 +2512,7 @@ static u32 porf_gc_free_page_count = 0;
 struct porf_gc_window { u32 cur, end, lo; };
 ${threads ? `// each thread allocates from its own windows (porf_gc_active is per thread)
 static struct porf_gc_window porf_main_gc_active[PORF_GC_NCLASSES];
-static porf_tstate porf_main_ts = { .gc_active = porf_main_gc_active, .exception = {0.0, ${TYPES.undefined}}, .iter_open = {0.0, ${TYPES.undefined}} };
+static porf_tstate porf_main_ts = { .gc_active = porf_main_gc_active, .lock_id = 1u << 12, .exception = {0.0, ${TYPES.undefined}}, .iter_open = {0.0, ${TYPES.undefined}} };
 ` : 'static struct porf_gc_window porf_gc_active[PORF_GC_NCLASSES];\n'}\
 static u32 porf_gc_partial[PORF_GC_NCLASSES];
 
@@ -4366,6 +4369,7 @@ typedef struct porf_tstate {
   i32 builtin_lock_depth;
   struct porf_tglobals* tg;
   u32 thread_obj;
+  u32 lock_id; // owner tag in array locks: a unique id << 12
   void* stack_lo;
   jmp_buf regs;
   struct porf_tstate* next;
@@ -4552,6 +4556,8 @@ static i32 porf_thread_spawn(u32 obj) {
   t->exception = JV_UNDEFINED;
   t->iter_open = JV_UNDEFINED;
   t->thread_obj = obj;
+  static u32 porf_lock_ids = 1;
+  t->lock_id = (__atomic_add_fetch(&porf_lock_ids, 1u, __ATOMIC_RELAXED) & 0xfffffu) << 12;
   porf_thread_register(t);
 
   pthread_mutex_lock(&porf_thread_done_lock);
@@ -4987,6 +4993,13 @@ PORF_NORETURN ${st}void porf_unreachable(const char* msg) {
 //         [flags u8 @16][lock u32 @20], entries inline from @24 until the first grow.
 // the shape word is published in one store and walked from one load, so a racing reader
 // never pairs a size with the wrong entries block (see _internal_object.ts)
+// value slots in memory (object entries, closure envs, array elements) are read and written
+// as one word. with threads that is a relaxed atomic: the same plain move natively, and
+// never a torn value on wasm
+${threads ? `#define porf_ld_bits(p) __atomic_load_n((jsbits*)(p), __ATOMIC_RELAXED)
+#define porf_st_bits(p, b) __atomic_store_n((jsbits*)(p), (b), __ATOMIC_RELAXED)` : `#define porf_ld_bits(p) (*(jsbits*)(p))
+#define porf_st_bits(p, b) (*(jsbits*)(p) = (b))`}
+
 #define PORF_OBJ_HDR 24u
 #define PORF_THREADED ${threads ? 1 : 0}
 #define PORF_OBJ_SHAPE(ent, size, cap) ((u64)(u32)(ent) | ((u64)(u16)(size) << 32) | ((u64)(u16)(cap) << 48))
@@ -5021,7 +5034,7 @@ static inline void porf_obj_store_word(u32 p, u64 w) { *(u64*)(MEM + p) = w; }
 ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 
 // ---- core layouts ----
-// array:      [len i32 @0][ent u32 @4][cap i32 @8]; entries = jsval[cap]
+// array:      [len i32 @0][ent u32 @4][cap i32 @8][lock u32 @12]; entries = jsval[cap]
 // object:     [count i32 @0][bcap i32 @4][ent u32 @8][buckets u32 @12]
 //             entries = {key jsval, val jsval}[count] in insertion order
 //             buckets = i32[bcap] entry indices, -1 empty (ordered hashmap)
@@ -5032,11 +5045,59 @@ ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 #define PORF_ARR_ENT(a) (*(u32*)(MEM + (a) + 4))
 #define PORF_ARR_CAP(a) (*(i32*)(MEM + (a) + 8))
 
+// with threads readers never lock. capacity never shrinks, and a grow publishes the new
+// entries before the new capacity, so a reader that loads the capacity and then the
+// entries (PORF_ARR_VIEW) always indexes inside the block it got. len may run ahead of
+// cap (length = n does not grow), so indexes are checked against both. every writer
+// holds the array's lock, which the holder may take again (a builtin keeps it across a
+// whole splice while the helpers it calls lock too)
+${threads ? `#define PORF_ARR_VIEW(a, ent, cap) do { (cap) = __atomic_load_n((u32*)(MEM + (a) + 8), __ATOMIC_ACQUIRE); (ent) = __atomic_load_n((u32*)(MEM + (a) + 4), __ATOMIC_ACQUIRE); } while (0)
+#define PORF_ARR_LEN_LOAD(a) __atomic_load_n((i32*)(MEM + (a)), __ATOMIC_ACQUIRE)
+#define PORF_ARR_LEN_STORE(a, n) __atomic_store_n((i32*)(MEM + (a)), (n), __ATOMIC_RELEASE)
+#define PORF_ARR_DEPTH 0xfffu
+static PORF_NOINLINE void porf_arr_lock_slow(u32* l, u32 me) {
+  for (;;) {
+    PORF_SAFEPOINT();
+    u32 z = 0;
+    if (__atomic_load_n(l, __ATOMIC_RELAXED) == 0 &&
+      __atomic_compare_exchange_n(l, &z, me | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    sched_yield();
+  }
+}
+static inline void porf_arr_lock(u32 a) {
+  u32* l = (u32*)(MEM + a + 12);
+  const u32 me = porf_ts->lock_id;
+  const u32 v = __atomic_load_n(l, __ATOMIC_RELAXED);
+  if ((v & ~PORF_ARR_DEPTH) == me) { __atomic_store_n(l, v + 1u, __ATOMIC_RELAXED); return; }
+  u32 z = 0;
+  if (__builtin_expect(!__atomic_compare_exchange_n(l, &z, me | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED), 0)) porf_arr_lock_slow(l, me);
+}
+static inline void porf_arr_unlock(u32 a) {
+  u32* l = (u32*)(MEM + a + 12);
+  const u32 v = __atomic_load_n(l, __ATOMIC_RELAXED);
+  if ((v & PORF_ARR_DEPTH) == 1u) __atomic_store_n(l, 0u, __ATOMIC_RELEASE);
+    else __atomic_store_n(l, v - 1u, __ATOMIC_RELAXED);
+}
+// clear or move whole value words, so a racing reader never sees a torn one
+static void porf_words_clear(u32 p, u32 n) { for (u32 i = 0; i < n; i++) porf_st_bits(MEM + p + ((u64)i << 3), 0); }
+static void porf_words_move(u32 dst, u32 src, u32 n) {
+  if (dst < src) for (u32 i = 0; i < n; i++) porf_st_bits(MEM + dst + ((u64)i << 3), porf_ld_bits(MEM + src + ((u64)i << 3)));
+    else for (u32 i = n; i-- > 0;) porf_st_bits(MEM + dst + ((u64)i << 3), porf_ld_bits(MEM + src + ((u64)i << 3)));
+}
+` : `#define PORF_ARR_VIEW(a, ent, cap) do { (cap) = (u32)PORF_ARR_CAP(a); (ent) = PORF_ARR_ENT(a); } while (0)
+#define PORF_ARR_LEN_LOAD(a) PORF_ARR_LEN(a)
+#define PORF_ARR_LEN_STORE(a, n) (PORF_ARR_LEN(a) = (n))
+#define porf_arr_lock(a) ((void)0)
+#define porf_arr_unlock(a) ((void)0)
+#define porf_words_clear(p, n) memset(MEM + (p), 0, (size_t)(n) << 3)
+#define porf_words_move(dst, src, n) memmove(MEM + (dst), MEM + (src), (size_t)(n) << 3)
+`}
+
 ${st}u32 porf_arr_new(i32 len, i32 cap) {
   if (cap < len) cap = len;
   if (cap < 4) cap = 4;
   const u32 a = porf_alloc(16 + ((u32)cap << 3), ${TYPES.array});
-  PORF_ARR_LEN(a) = len; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap;
+  PORF_ARR_LEN(a) = len; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap; *(u32*)(MEM + a + 12) = 0;
   memset(MEM + PORF_ARR_ENT(a), 0, (size_t)cap << 3);
   return a;
 }
@@ -5048,35 +5109,44 @@ static inline u32 porf_scratch_arr(u32* slot, i32 cap) {
 }
 ` : ''}
 ${sti}int porf_arr_has_own(u32 a, u32 i) {
-  if (i >= (u32)PORF_ARR_LEN(a)) return 0;
-  return *(jsbits*)(MEM + PORF_ARR_ENT(a) + ((u64)i << 3)) != 0;
+  u32 ent, cap;
+  PORF_ARR_VIEW(a, ent, cap);
+  if (i >= (u32)PORF_ARR_LEN_LOAD(a) || i >= cap) return 0;
+  return porf_ld_bits(MEM + ent + ((u64)i << 3)) != 0;
 }
 
 ${sti}jsval porf_arr_get(u32 a, u32 i) {
-  if (i >= (u32)PORF_ARR_LEN(a)) return JV_UNDEFINED;
-  const jsbits b = *(jsbits*)(MEM + PORF_ARR_ENT(a) + ((u64)i << 3));
+  u32 ent, cap;
+  PORF_ARR_VIEW(a, ent, cap);
+  if (i >= (u32)PORF_ARR_LEN_LOAD(a) || i >= cap) return JV_UNDEFINED;
+  const jsbits b = porf_ld_bits(MEM + ent + ((u64)i << 3));
   if (b == 0) return JV_UNDEFINED;
   return porf_unpack(b);
 }
 
+// a builtin writing through the returned entries holds the lock (__Porffor_array_lock)
 ${st}u32 porf_arr_grow(PORF_ROOT u32 a, i32 need) {
+  porf_arr_lock(a);
   i32 cap = PORF_ARR_CAP(a);
-  if (need <= cap) return PORF_ARR_ENT(a);
+  if (need <= cap) { const u32 ent = PORF_ARR_ENT(a); porf_arr_unlock(a); return ent; }
   const i32 copy = PORF_ARR_LEN(a) < cap ? PORF_ARR_LEN(a) : cap;
   while (cap < need) cap += cap >> 1 > 4 ? cap >> 1 : 4;
   const u32 ent = porf_alloc((u32)cap << 3, 0);
   memcpy(MEM + ent, MEM + PORF_ARR_ENT(a), (size_t)copy << 3);
   memset(MEM + ent + ((u64)copy << 3), 0, ((size_t)cap - (size_t)copy) << 3);
-  PORF_ARR_ENT(a) = ent; PORF_ARR_CAP(a) = cap;
+${threads ? `  __atomic_store_n((u32*)(MEM + a + 4), ent, __ATOMIC_RELEASE);
+  __atomic_store_n((u32*)(MEM + a + 8), (u32)cap, __ATOMIC_RELEASE);` : `  PORF_ARR_ENT(a) = ent; PORF_ARR_CAP(a) = cap;`}
+  porf_arr_unlock(a);
   porf_gc_barrier(a, ${TYPES.array});
   return ent;
 }
 
 ${st}void porf_arr_set(PORF_ROOT u32 a, u32 i, PORF_ROOT jsval v) {
-  const i32 len = PORF_ARR_LEN(a);
+  porf_arr_lock(a);
   if (i >= (u32)PORF_ARR_CAP(a)) porf_arr_grow(a, (i32)i + 1);
-  if (i >= (u32)len) PORF_ARR_LEN(a) = (i32)i + 1;
-  *(jsbits*)(MEM + PORF_ARR_ENT(a) + ((u64)i << 3)) = porf_arr_pack(v);
+  porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), porf_arr_pack(v));
+  if (i >= (u32)PORF_ARR_LEN(a)) PORF_ARR_LEN_STORE(a, (i32)i + 1);
+  porf_arr_unlock(a);
   if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
 }
 ${iterClose ? `
@@ -5107,25 +5177,30 @@ static void porf_iter_unwind(void) {
 }
 ` : ''}
 ${st}void porf_arr_delete(u32 a, u32 i) {
-  if (i >= (u32)PORF_ARR_LEN(a)) return;
-  *(jsbits*)(MEM + PORF_ARR_ENT(a) + ((u64)i << 3)) = 0;
+  porf_arr_lock(a);
+  if (i < (u32)PORF_ARR_LEN(a) && i < (u32)PORF_ARR_CAP(a)) porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), 0);
+  porf_arr_unlock(a);
 }
 
 ${st}void porf_arr_set_len(u32 a, u32 new_len) {
+  porf_arr_lock(a);
   const u32 old_len = (u32)PORF_ARR_LEN(a);
   if (new_len < old_len) {
     const u32 cap = (u32)PORF_ARR_CAP(a);
     const u32 clear = old_len < cap ? old_len : cap;
-    if (new_len < clear) memset(MEM + PORF_ARR_ENT(a) + ((u64)new_len << 3), 0, ((size_t)clear - new_len) << 3);
+    if (new_len < clear) porf_words_clear(PORF_ARR_ENT(a) + (new_len << 3), clear - new_len);
   }
-  PORF_ARR_LEN(a) = (i32)new_len;
+  PORF_ARR_LEN_STORE(a, (i32)new_len);
+  porf_arr_unlock(a);
 }
 
 ${st}jsval porf_arr_push(PORF_ROOT u32 a, PORF_ROOT jsval v) {
+  porf_arr_lock(a);
   const i32 len = PORF_ARR_LEN(a);
   porf_arr_grow(a, len + 1);
-  *(jsbits*)(MEM + PORF_ARR_ENT(a) + ((u64)len << 3)) = porf_arr_pack(v);
-  PORF_ARR_LEN(a) = len + 1;
+  porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)len << 3), porf_arr_pack(v));
+  PORF_ARR_LEN_STORE(a, len + 1);
+  porf_arr_unlock(a);
   if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
   return porf_box_num((f64)(len + 1));
 }

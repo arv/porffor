@@ -845,20 +845,11 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
   key = ecma262.ToPropertyKey(key);
   const hash: i32 = __Porffor_object_hash(key);
   if (trueType == Porffor.TYPES.array) {
-    const index: i32 = __Porffor_array_propertyKeyIndex(key);
-    if (Porffor.fastAnd(index != -1, __Porffor_object_lookup(obj, key, hash) == 0)) {
-      let arr: i32 = Porffor.IR.ptr(_obj);
-      const needed: i32 = index + 1;
-      const entries: i32 = __Porffor_array_ensure(arr, needed);
-      if (needed > Porffor.IR.loadI32(arr, 0)) Porffor.IR.storeI32(arr, 0, needed);
-
-      const entry: i32 = entries + index * 8;
-      if (Porffor.fastAnd(Porffor.type(value) == Porffor.TYPES.number, value === 0, 1 / value == Infinity)) {
-        Porffor.IR.storeU64(entry, 0, -2243003720663040);
-      } else {
-        Porffor.IR.storeJv(entry, 0, value);
-      }
-      Porffor.IR.gcBarrierValue(arr, Porffor.TYPES.array, value);
+    const arrIndex: i32 = __Porffor_array_propertyKeyIndex(key);
+    if (Porffor.fastAnd(arrIndex != -1, __Porffor_object_lookup(obj, key, hash) == 0)) {
+      // grows, stores the element, then raises the length (under the array's lock)
+      const arr: i32 = Porffor.IR.ptr(_obj);
+      Porffor.c`porf_arr_set((u32)arr, (u32)arrIndex, value);`;
       return value;
     }
   }
@@ -1060,20 +1051,11 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
   key = ecma262.ToPropertyKey(key);
   const hash: i32 = __Porffor_object_hash(key);
   if (trueType == Porffor.TYPES.array) {
-    const index: i32 = __Porffor_array_propertyKeyIndex(key);
-    if (Porffor.fastAnd(index != -1, __Porffor_object_lookup(obj, key, hash) == 0)) {
-      let arr: i32 = Porffor.IR.ptr(_obj);
-      const needed: i32 = index + 1;
-      const entries: i32 = __Porffor_array_ensure(arr, needed);
-      if (needed > Porffor.IR.loadI32(arr, 0)) Porffor.IR.storeI32(arr, 0, needed);
-
-      const entry: i32 = entries + index * 8;
-      if (Porffor.fastAnd(Porffor.type(value) == Porffor.TYPES.number, value === 0, 1 / value == Infinity)) {
-        Porffor.IR.storeU64(entry, 0, -2243003720663040);
-      } else {
-        Porffor.IR.storeJv(entry, 0, value);
-      }
-      Porffor.IR.gcBarrierValue(arr, Porffor.TYPES.array, value);
+    const arrIndex: i32 = __Porffor_array_propertyKeyIndex(key);
+    if (Porffor.fastAnd(arrIndex != -1, __Porffor_object_lookup(obj, key, hash) == 0)) {
+      // grows, stores the element, then raises the length (under the array's lock)
+      const arr: i32 = Porffor.IR.ptr(_obj);
+      Porffor.c`porf_arr_set((u32)arr, (u32)arrIndex, value);`;
       return value;
     }
   }

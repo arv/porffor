@@ -166,16 +166,21 @@ export const __Array_prototype_at = function (this: any[], index: any) {
   return this[index];
 };
 
+// push/pop/shift/unshift/splice hold an array's lock throughout (with threads), so
+// racing calls neither lose elements nor take the same one
 export const __Array_prototype_push = function (this: any[], ...items: any[]) {
+  const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
+  if (isArray) __Porffor_array_lock(this);
   let len: i32 = this.length;
   const itemsLen: i32 = items.length;
   const newLen: i32 = len + itemsLen;
-  this.length = newLen;
 
   for (let i: i32 = 0; i < itemsLen; i++) {
     this[i + len] = items[i];
   }
 
+  this.length = newLen;
+  if (isArray) __Porffor_array_unlock(this);
   return newLen;
 };
 
@@ -220,38 +225,51 @@ export const __Porffor_array_spread = (arr: any[], src: any) => {
 };
 
 export const __Array_prototype_pop = function (this: any[]) {
+  const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
+  if (isArray) __Porffor_array_lock(this);
   const len: i32 = this.length;
-  if (len == 0) return undefined;
+  if (len == 0) {
+    if (isArray) __Porffor_array_unlock(this);
+    return undefined;
+  }
 
   const lastIndex: i32 = len - 1;
   const element: any = this[lastIndex];
   __Porffor_array_setLength(this, lastIndex);
 
+  if (isArray) __Porffor_array_unlock(this);
   return element;
 };
 
 export const __Array_prototype_shift = function (this: any[]) {
+  const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
+  if (isArray) __Porffor_array_lock(this);
   const len: i32 = this.length;
-  if (len == 0) return undefined;
+  if (len == 0) {
+    if (isArray) __Porffor_array_unlock(this);
+    return undefined;
+  }
 
   const element: any = this[0];
-  if (Porffor.type(this) == Porffor.TYPES.array) {
+  if (isArray) {
     // holes are zero entries, so they move with the rest
     const entries: i32 = __Porffor_array_ensure(this, len);
-    Porffor.IR.copy(entries, entries + 8, (len - 1) * 8);
+    __Porffor_array_moveWords(entries, entries + 8, len - 1);
     Porffor.IR.gcBarrier(this, Porffor.TYPES.array);
   } else {
     for (let i: i32 = 1; i < len; i++) this[i - 1] = this[i];
   }
   __Porffor_array_setLength(this, len - 1);
 
+  if (isArray) __Porffor_array_unlock(this);
   return element;
 };
 
 export const __Array_prototype_unshift = function (this: any[], ...items: any[]) {
+  const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
+  if (isArray) __Porffor_array_lock(this);
   let len: i32 = this.length;
   const itemsLen: i32 = items.length;
-  const isArray: boolean = Porffor.type(this) == Porffor.TYPES.array;
 
   let i: i32 = len;
   while (i > 0) {
@@ -266,6 +284,7 @@ export const __Array_prototype_unshift = function (this: any[], ...items: any[])
 
   const newLen: i32 = len + itemsLen;
   __Porffor_array_setLength(this, newLen);
+  if (isArray) __Porffor_array_unlock(this);
   return newLen;
 };
 
@@ -331,7 +350,11 @@ export const __Array_prototype_splice = function (this: any[], _start: any, _del
   const itemsLen: i32 = items.length;
   const newLen: i32 = len - deleteCount + itemsLen;
   const tailLen: i32 = len - start - deleteCount;
-  const entries: i32 = __Porffor_array_ensure(this, newLen);
+
+  // after the conversions above, which may run user code. storage covers len too
+  // (length = n leaves it short), as the tail is read up to there
+  __Porffor_array_lock(this);
+  const entries: i32 = __Porffor_array_ensure(this, newLen > len ? newLen : len);
 
   if (deleteCount > 0) {
     const outEntries: i32 = Porffor.IR.loadI32(out, 4);
@@ -339,20 +362,19 @@ export const __Array_prototype_splice = function (this: any[], _start: any, _del
   }
   out.length = deleteCount;
 
-  if (itemsLen < deleteCount) {
-    Porffor.IR.copy(entries + (start + itemsLen) * 8, entries + (start + deleteCount) * 8, tailLen * 8);
-  } else if (itemsLen > deleteCount) {
-    Porffor.IR.copy(entries + (start + itemsLen) * 8, entries + (start + deleteCount) * 8, tailLen * 8);
+  if (itemsLen != deleteCount) {
+    __Porffor_array_moveWords(entries + (start + itemsLen) * 8, entries + (start + deleteCount) * 8, tailLen);
   }
 
   if (itemsLen > 0) {
     const itemsEntries: i32 = __Porffor_array_ensure(items, 0);
-    Porffor.IR.copy(entries + start * 8, itemsEntries, itemsLen * 8);
+    __Porffor_array_moveWords(entries + start * 8, itemsEntries, itemsLen);
     Porffor.IR.gcBarrier(this, Porffor.TYPES.array);
   }
 
   __Porffor_array_setLength(this, newLen);
 
+  __Porffor_array_unlock(this);
   return out;
 };
 

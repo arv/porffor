@@ -563,6 +563,7 @@ static i32 collect_headers(uWS::HttpRequest* req) {
   *((i32*)(porf_mem + headers_ptr)) = 0;
   *((u32*)(porf_mem + headers_ptr + 4)) = (u32)entries_ptr;
   *((i32*)(porf_mem + headers_ptr + 8)) = header_capacity;
+  *((u32*)(porf_mem + headers_ptr + 12)) = 0;
   i32 slot = 0;
   for (auto [key, value] : *req) {
     const i32 key_base = entries_ptr + slot * 8;

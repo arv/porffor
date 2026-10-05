@@ -758,6 +758,25 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
   comptime('__Porffor_array_ensure', TYPES.number, (scope, decl, { generate }) =>
     Call('porf_arr_grow', [ rawPtr(generate(scope, decl.arguments[0])), rawI32(generate(scope, decl.arguments[1])) ], T.u32));
 
+  // with threads, held by a builtin across writes through __Porffor_array_ensure's entries
+  // (reentrant: the porf_arr_* helpers it calls meanwhile lock too). no-ops otherwise
+  comptime('__Porffor_array_lock', TYPES.undefined, (scope, decl, { generate, exprStmt }) => {
+    exprStmt(scope, Call('porf_arr_lock', [ rawPtr(generate(scope, decl.arguments[0])) ], T.none));
+    return JvConst(TYPES.undefined, 0);
+  });
+
+  comptime('__Porffor_array_unlock', TYPES.undefined, (scope, decl, { generate, exprStmt }) => {
+    exprStmt(scope, Call('porf_arr_unlock', [ rawPtr(generate(scope, decl.arguments[0])) ], T.none));
+    return JvConst(TYPES.undefined, 0);
+  });
+
+  // move value words within live storage (whole words, see porf_words_move)
+  comptime('__Porffor_array_moveWords', TYPES.undefined, (scope, decl, { generate, exprStmt }) => {
+    const [ dst, src, n ] = decl.arguments.map(x => rawI32(generate(scope, x)));
+    exprStmt(scope, Call('porf_words_move', [ dst, src, n ], T.none));
+    return JvConst(TYPES.undefined, 0);
+  });
+
   comptime('__Porffor_array_has', TYPES.boolean, (scope, decl, { generate }) =>
     Box(Call('porf_arr_has_own', [ rawPtr(generate(scope, decl.arguments[0])), rawI32(generate(scope, decl.arguments[1])) ], T.i32), Const(T.i32, TYPES.boolean)));
 
