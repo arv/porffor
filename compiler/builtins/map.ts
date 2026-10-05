@@ -6,41 +6,53 @@ export const __Map_prototype_size$get = function (this: Map) {
 };
 
 export const __Map_prototype_has = function (this: Map, key: any) {
-  return __Porffor_hashtableLookup(this, key) != -1;
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
+  const found: boolean = __Porffor_hashtableLookup(this, key) != -1;
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
+  return found;
 };
 
 export const __Map_prototype_get = function (this: Map, key: any) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
+  let out: any = undefined;
   const index: i32 = __Porffor_hashtableLookup(this, key);
-  if (index == -1) return undefined;
+  if (index != -1) {
+    const vals: any[] = Porffor.IR.loadI32(this, 4);
+    out = vals[index];
+  }
 
-  const vals: any[] = Porffor.IR.loadI32(this, 4);
-  return vals[index];
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
+  return out;
 };
 
 export const __Map_prototype_set = function (this: Map, key: any, value: any) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   const vals: any[] = Porffor.IR.loadI32(this, 4);
 
   const index: i32 = __Porffor_hashtableLookup(this, key);
   if (index != -1) {
     vals[index] = value;
-    return this;
+  } else {
+    // push the value first so vals stays in sync if append compacts both arrays
+    Porffor.array.fastPush(vals, value);
+    __Porffor_hashtableAppend(this, key);
   }
 
-  // push the value first so vals stays in sync if append compacts both arrays
-  Porffor.array.fastPush(vals, value);
-  __Porffor_hashtableAppend(this, key);
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
   return this;
 };
 
 export const __Map_prototype_delete = function (this: Map, key: any) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   const index: i32 = __Porffor_hashtableLookup(this, key);
-  if (index == -1) return false;
+  if (index != -1) __Porffor_hashtableTombstone(this, key, index);
 
-  __Porffor_hashtableTombstone(this, key, index);
-  return true;
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
+  return index != -1;
 };
 
 export const __Map_prototype_clear = function (this: Map) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   const keys: any[] = Porffor.IR.loadI32(this, 0);
   __Porffor_array_ensure(keys, 0);
   keys.length = 0;
@@ -52,6 +64,7 @@ export const __Map_prototype_clear = function (this: Map) {
   Porffor.IR.storeI32(this, 8, 0);
   Porffor.IR.storeI32(this, 12, 0);
   Porffor.IR.storeI32(this, 16, 0);
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
 };
 
 export const __Map_prototype_forEach = function (this: Map, callbackFn: any, thisArg: any = undefined) {
@@ -61,9 +74,16 @@ export const __Map_prototype_forEach = function (this: Map, callbackFn: any, thi
   const vals: any[] = Porffor.IR.loadI32(this, 4);
 
   // callbackFn can add entries, which must be visited and can move the entries buffer
+  // each key read once, with its value under the lock (not across the user callback)
   for (let i: i32 = 0; i < keys.length; i++) {
-    if (Porffor.IR.loadU64(Porffor.IR.loadI32(keys, 4) + i * 8, 0) == -1) continue;
-    callbackFn.call(thisArg, vals[i], keys[i], this);
+    __Porffor_rlock(Porffor.IR.ptr(this) + 20);
+    const bits: i64 = __Porffor_array_getBits(keys, i);
+    const value: any = vals[i];
+    __Porffor_runlock(Porffor.IR.ptr(this) + 20);
+    if (bits == -1) continue;
+    // 0 (keys are never 0): another thread shrank keys meanwhile, past the end now
+    if (bits == 0) break;
+    callbackFn.call(thisArg, value, __Porffor_array_fromBits(bits), this);
   }
 };
 
@@ -82,6 +102,7 @@ export const Map = function (iterable: any): Map {
 };
 
 export const __Map_prototype_keys = function (this: Map) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   const keys: any[] = Porffor.IR.loadI32(this, 0);
   const keysEntries: i32 = Porffor.IR.loadI32(keys, 4);
   const out: any[] = Porffor.array.new(4);
@@ -92,10 +113,12 @@ export const __Map_prototype_keys = function (this: Map) {
     Porffor.array.fastPush(out, keys[i]);
   }
 
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
   return out;
 };
 
 export const __Map_prototype_values = function (this: Map) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   const keys: any[] = Porffor.IR.loadI32(this, 0);
   const keysEntries: i32 = Porffor.IR.loadI32(keys, 4);
   const vals: any[] = Porffor.IR.loadI32(this, 4);
@@ -107,10 +130,12 @@ export const __Map_prototype_values = function (this: Map) {
     Porffor.array.fastPush(out, vals[i]);
   }
 
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
   return out;
 };
 
 export const __Map_prototype_entries = function (this: Map) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   const keys: any[] = Porffor.IR.loadI32(this, 0);
   const keysEntries: i32 = Porffor.IR.loadI32(keys, 4);
   const vals: any[] = Porffor.IR.loadI32(this, 4);
@@ -125,6 +150,7 @@ export const __Map_prototype_entries = function (this: Map) {
     Porffor.array.fastPush(out, entry);
   }
 
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
   return out;
 };
 
@@ -133,16 +159,25 @@ export const __Map_prototype_toLocaleString = function (this: Map) { return Porf
 
 // https://github.com/tc39/proposal-upsert
 export const __Map_prototype_getOrInsert = function (this: Map, key: any, value: any) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   if (!Porffor.callThis(__Map_prototype_has, this, key)) {
     Porffor.callThis(__Map_prototype_set, this, key, value);
   }
 
-  return Porffor.callThis(__Map_prototype_get, this, key);
+  const out: any = Porffor.callThis(__Map_prototype_get, this, key);
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
+  return out;
 };
 
 export const __Map_prototype_getOrInsertComputed = function (this: Map, key: any, callbackFn: any) {
   if (!Porffor.callThis(__Map_prototype_has, this, key)) {
-    Porffor.callThis(__Map_prototype_set, this, key, callbackFn(key));
+    // not under the lock: callbackFn is user code
+    const value: any = callbackFn(key);
+    __Porffor_rlock(Porffor.IR.ptr(this) + 20);
+    Porffor.callThis(__Map_prototype_set, this, key, value);
+    const out: any = Porffor.callThis(__Map_prototype_get, this, key);
+    __Porffor_runlock(Porffor.IR.ptr(this) + 20);
+    return out;
   }
 
   return Porffor.callThis(__Map_prototype_get, this, key);

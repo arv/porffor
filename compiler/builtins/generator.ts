@@ -104,21 +104,34 @@ export const __Porffor_iterator_step = (rec: any[]): any => {
 
   let i: i32 = rec[1];
   if (Porffor.fastOr(t == Porffor.TYPES.set, t == Porffor.TYPES.map)) {
+    // each slot read once: another thread may tombstone or compact it meanwhile. a map's
+    // value is read with its key under the container's lock
     const keys: any[] = Porffor.IR.loadI32(iter, 0);
-    const entries: i32 = Porffor.IR.loadI32(keys, 4);
-    while (i < keys.length && Porffor.IR.loadU64(entries + i * 8, 0) == -1) i++;
-    if (i >= keys.length) {
+    __Porffor_rlock(Porffor.IR.ptr(iter) + 20);
+    let bits: i64 = -1;
+    while (i < keys.length) {
+      bits = __Porffor_array_getBits(keys, i);
+      if (bits != -1) break;
+      i++;
+    }
+    let value: any = undefined;
+    if (t == Porffor.TYPES.map) {
+      const vals: any[] = Porffor.IR.loadI32(iter, 4);
+      value = vals[i];
+    }
+    __Porffor_runlock(Porffor.IR.ptr(iter) + 20);
+    if (bits == -1) {
       rec[2] = true;
       return undefined;
     }
 
     rec[1] = i + 1;
-    if (t == Porffor.TYPES.set) return keys[i];
+    const key: any = __Porffor_array_fromBits(bits);
+    if (t == Porffor.TYPES.set) return key;
 
-    const vals: any[] = Porffor.IR.loadI32(iter, 4);
     const entry: any[] = Porffor.array.new(2);
-    entry[0] = keys[i];
-    entry[1] = vals[i];
+    entry[0] = key;
+    entry[1] = value;
     return entry;
   }
 

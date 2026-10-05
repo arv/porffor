@@ -1571,7 +1571,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
       const rootLines = perThread ? markThreadRootLines : markGlobalRootLines;
       const rawLines = perThread ? markThreadRawLines : markGlobalRawLines;
       if (g.type === T.jsval) rootLines.push(packedGlobal(g.name)
-        ? `  { const jsval v = porf_unpack(${sanitize(g.name)}); porf_gc_mark_js(v.val, v.type); }`
+        ? `  { const jsval porf_gv_ = porf_unpack(${sanitize(g.name)}); porf_gc_mark_js(porf_gv_.val, porf_gv_.type); }`
         : `  porf_gc_mark_js(${name}.val, ${name}.type);`);
       else if (g.type === T.ptr || (g.type === T.i32 && /(?:underlyingStore|underlyingBuckets|__Porffor_regex_cache|__Porffor_dataview_reinterpretTemp)$/.test(g.name))) {
         if (/underlyingStore$/.test(g.name)) {
@@ -5055,7 +5055,9 @@ ${threads ? `#define PORF_ARR_VIEW(a, ent, cap) do { (cap) = __atomic_load_n((u3
 #define PORF_ARR_LEN_LOAD(a) __atomic_load_n((i32*)(MEM + (a)), __ATOMIC_ACQUIRE)
 #define PORF_ARR_LEN_STORE(a, n) __atomic_store_n((i32*)(MEM + (a)), (n), __ATOMIC_RELEASE)
 #define PORF_ARR_DEPTH 0xfffu
-static PORF_NOINLINE void porf_arr_lock_slow(u32* l, u32 me) {
+// a lock word at p (arrays @12, map/set containers @20): the owner's lock_id | depth.
+// the owner may take it again; a waiter parks for collections like the object lock
+static PORF_NOINLINE void porf_rlock_slow(u32* l, u32 me) {
   for (;;) {
     PORF_SAFEPOINT();
     u32 z = 0;
@@ -5064,20 +5066,22 @@ static PORF_NOINLINE void porf_arr_lock_slow(u32* l, u32 me) {
     sched_yield();
   }
 }
-static inline void porf_arr_lock(u32 a) {
-  u32* l = (u32*)(MEM + a + 12);
+static inline void porf_rlock(u32 p) {
+  u32* l = (u32*)(MEM + p);
   const u32 me = porf_ts->lock_id;
   const u32 v = __atomic_load_n(l, __ATOMIC_RELAXED);
   if ((v & ~PORF_ARR_DEPTH) == me) { __atomic_store_n(l, v + 1u, __ATOMIC_RELAXED); return; }
   u32 z = 0;
-  if (__builtin_expect(!__atomic_compare_exchange_n(l, &z, me | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED), 0)) porf_arr_lock_slow(l, me);
+  if (__builtin_expect(!__atomic_compare_exchange_n(l, &z, me | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED), 0)) porf_rlock_slow(l, me);
 }
-static inline void porf_arr_unlock(u32 a) {
-  u32* l = (u32*)(MEM + a + 12);
+static inline void porf_runlock(u32 p) {
+  u32* l = (u32*)(MEM + p);
   const u32 v = __atomic_load_n(l, __ATOMIC_RELAXED);
   if ((v & PORF_ARR_DEPTH) == 1u) __atomic_store_n(l, 0u, __ATOMIC_RELEASE);
     else __atomic_store_n(l, v - 1u, __ATOMIC_RELAXED);
 }
+#define porf_arr_lock(a) porf_rlock((u32)(a) + 12u)
+#define porf_arr_unlock(a) porf_runlock((u32)(a) + 12u)
 // clear or move whole value words, so a racing reader never sees a torn one
 static void porf_words_clear(u32 p, u32 n) { for (u32 i = 0; i < n; i++) porf_st_bits(MEM + p + ((u64)i << 3), 0); }
 static void porf_words_move(u32 dst, u32 src, u32 n) {
@@ -5087,6 +5091,8 @@ static void porf_words_move(u32 dst, u32 src, u32 n) {
 ` : `#define PORF_ARR_VIEW(a, ent, cap) do { (cap) = (u32)PORF_ARR_CAP(a); (ent) = PORF_ARR_ENT(a); } while (0)
 #define PORF_ARR_LEN_LOAD(a) PORF_ARR_LEN(a)
 #define PORF_ARR_LEN_STORE(a, n) (PORF_ARR_LEN(a) = (n))
+#define porf_rlock(p) ((void)0)
+#define porf_runlock(p) ((void)0)
 #define porf_arr_lock(a) ((void)0)
 #define porf_arr_unlock(a) ((void)0)
 #define porf_words_clear(p, n) memset(MEM + (p), 0, (size_t)(n) << 3)
@@ -5123,6 +5129,16 @@ ${sti}jsval porf_arr_get(u32 a, u32 i) {
   if (b == 0) return JV_UNDEFINED;
   return porf_unpack(b);
 }
+
+// one read of slot i as its raw word: 0 (a hole) past the end. iteration over map/set
+// keys reads each slot once like this, as a tombstone (~0) may appear at any time
+${sti}jsbits porf_arr_get_bits(u32 a, u32 i) {
+  u32 ent, cap;
+  PORF_ARR_VIEW(a, ent, cap);
+  if (i >= (u32)PORF_ARR_LEN_LOAD(a) || i >= cap) return 0;
+  return porf_ld_bits(MEM + ent + ((u64)i << 3));
+}
+${sti}jsval porf_arr_unbits(jsbits b) { return b == 0 ? JV_UNDEFINED : porf_unpack(b); }
 
 // a builtin writing through the returned entries holds the lock (__Porffor_array_lock)
 ${st}u32 porf_arr_grow(PORF_ROOT u32 a, i32 need) {

@@ -1,7 +1,9 @@
 import type {} from './porffor.d.ts';
 
 // shared ordered hash table core (Map/Set/WeakMap/WeakSet)
-// container: { keys array @0, vals array or 0 @4, buckets @8, bucket capacity @12, tombstones @16 }
+// container: { keys array @0, vals array or 0 @4, buckets @8, bucket capacity @12, tombstones @16, lock @20 }
+// with threads every operation that runs no user code holds the container's lock (@20, see
+// porf_rlock), and iteration reads each keys slot once (__Porffor_array_getBits) instead
 // buckets: i32 slots, lazily allocated, 0 = empty, -1 = deleted, else key index + 1
 // deleted dense entries: key type byte 0xff (value 0)
 
@@ -113,14 +115,15 @@ export const __Porffor_hashtableCompact = (container: any): void => {
     const keyPtr: i32 = keysEntries + i * 8;
     if (Porffor.IR.loadU64(keyPtr, 0) == -1) continue;
 
+    // whole words: an iterator on another thread may be reading these slots
     if (out != i) {
       const outPtr: i32 = keysEntries + out * 8;
-      Porffor.IR.copy(outPtr, keyPtr, 8);
+      __Porffor_wordStore(outPtr, Porffor.IR.loadU64(keyPtr, 0));
 
       if (vals != 0) {
         const valPtr: i32 = valsEntries + i * 8;
         const valOutPtr: i32 = valsEntries + out * 8;
-        Porffor.IR.copy(valOutPtr, valPtr, 8);
+        __Porffor_wordStore(valOutPtr, Porffor.IR.loadU64(valPtr, 0));
       }
     }
     out += 1;
@@ -179,7 +182,7 @@ export const __Porffor_hashtableTombstone = (container: any, key: any, index: an
   Porffor.IR.storeI32(buckets + slot * 4, 0, -1);
 
   const keyPtr: i32 = keysEntries + index * 8;
-  Porffor.IR.storeU64(keyPtr, 0, -1);
+  __Porffor_wordStore(keyPtr, -1);
 
   const vals: i32 = Porffor.IR.loadI32(container, 4);
   if (vals != 0) {
@@ -194,7 +197,8 @@ export const __Porffor_hashtableTombstone = (container: any, key: any, index: an
 };
 
 export const __Porffor_hashtableNew = (withVals: boolean): any => {
-  const out: any = Porffor.malloc(20);
+  const out: any = Porffor.malloc(24);
+  Porffor.IR.storeI32(out, 20, 0);
 
   const keys: any[] = Porffor.array.new(4);
   Porffor.IR.storeI32(out, 0, keys);

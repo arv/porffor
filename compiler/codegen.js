@@ -72,7 +72,7 @@ const coerceValue = (v, type) => type === T.jsval ? (v[N_TYPE] === T.jsval ? v :
   : v[N_TYPE] === type ? v
   : type === T.ptr ? (isRawInt(v) ? Convert(T.ptr, v, 0) : JvPtr(v))
   : type === T.f64 ? numValue(v)
-  : (type === T.i32 || type === T.u32) && isRawInt(v) ? Convert(type, v, type === T.i32 ? CONVERT_SIGNED : 0)
+  : (type === T.i32 || type === T.u32 || type === T.i64 || type === T.u64) && isRawInt(v) ? Convert(type, v, type === T.i32 || type === T.i64 ? CONVERT_SIGNED : 0)
   : Convert(type, numValue(v), type === T.i32 ? CONVERT_SIGNED : 0);
 const coerceReturnValue = (scope, v) => {
   if (scope.retType !== T.jsval) return coerceValue(v, scope.retType);
@@ -651,6 +651,8 @@ const generate = (scope, decl, name = undefined, valueUnused = false) => {
         if (value[N_TYPE] === type.irType) return value;
         if (type.irType === T.f64) return numValue(value);
         if (type.irType === T.ptr) return JvPtr(value);
+        // raw ints convert directly: a 64-bit word would not survive a trip through f64
+        if (isRawInt(value)) return Convert(type.irType, value, type.irType === T.i32 || type.irType === T.i64 ? CONVERT_SIGNED : 0);
         return Convert(type.irType, numValue(value), type.irType === T.i32 ? CONVERT_SIGNED : 0);
       }
       if (type.type === TYPES.bigint) return Box(numValue(value), Const(T.i32, TYPES.bigint));
@@ -3548,12 +3550,28 @@ const generateForOf = (scope, decl) => {
     assign(scope, counter, Bin('+', T.i32, counter, Const(T.i32, 1)));
     return valOf(out, strType);
   };
-  const skipTombstones = (count, entries) => {
+  // the next live keys slot of a set/map, read once (another thread may tombstone or
+  // compact it meanwhile): its raw word, or the loop ends. a map's value is read with it
+  // under the container's lock (no-op without threads), so the two always match
+  const nextKeyBits = (keys, vals = null) => {
+    const bits = tmp(scope, T.u64);
+    const val = vals ? tmp(scope, T.jsval) : null;
+    const lock = Bin('+', T.u32, pointer, Const(T.u32, 20));
+    if (vals) stmt(scope, Call('porf_rlock', [ lock ], T.none));
+    assign(scope, bits, Const(T.u64, -1));
     const sk = fresh(scope);
-    stmt(scope, Loop(Bin('<', T.u32, counter, count), null, [
-      If(Bin('!=', T.u64, Load('u64', Bin('+', T.u32, entries, Bin('*', T.u32, counter, Const(T.u32, 8))), 0), Const(T.u64, -1)), [ Break(sk) ], null),
+    stmt(scope, Loop(Bin('<', T.u32, counter, LenGet(keys)), null, [
+      Assign(bits, Call('porf_arr_get_bits', [ keys, counter ], T.u64)),
+      If(Bin('!=', T.u64, bits, Const(T.u64, -1)), [ Break(sk) ], null),
       Assign(counter, Bin('+', T.i32, counter, Const(T.i32, 1)))
     ], sk));
+    if (vals) {
+      assign(scope, val, ArrGet(vals, counter));
+      stmt(scope, Call('porf_runlock', [ lock ], T.none));
+    }
+    // ~0: no live slot left. 0 (a key never is): keys shrank under us, past the end now
+    emitIf(scope, Bin('||', T.i32, Bin('==', T.u64, bits, Const(T.u64, -1)), Bin('==', T.u64, bits, Const(T.u64, 0))), () => stmt(scope, Break(L)));
+    return [ bits, val ];
   };
 
   const valName = tmp(scope, T.jsval)[N_A];
@@ -3589,25 +3607,16 @@ const generateForOf = (scope, decl) => {
       [ TYPES.biguint64array, taNext('i64', 8, x => Box(builtinCall(scope, '__Porffor_bigint_fromU64', [ x ]), Const(T.i32, TYPES.bigint))) ],
 
       [ TYPES.set, () => {
-        const count = reuse(scope, Load('u32', length, 0));
-        const entries = reuse(scope, Load('u32', length, 4));
-        skipTombstones(count, entries);
-        emitIf(scope, Bin('>=', T.i32, counter, count), () => stmt(scope, Break(L)));
-        const v = reuse(scope, Load('jsval', Bin('+', T.u32, entries, Bin('*', T.u32, counter, Const(T.u32, 8))), 0));
+        const v = reuse(scope, Call('porf_arr_unbits', [ nextKeyBits(length)[0] ], T.jsval));
         assign(scope, counter, Bin('+', T.i32, counter, Const(T.i32, 1)));
         return v;
       } ],
 
       [ TYPES.map, () => {
-        const count = reuse(scope, Load('u32', length, 0));
-        const keysEnt = reuse(scope, Load('u32', length, 4));
-        const valsEnt = reuse(scope, Load('u32', Load('u32', pointer, 4), 4));
-        skipTombstones(count, keysEnt);
-        emitIf(scope, Bin('>=', T.i32, counter, count), () => stmt(scope, Break(L)));
-        const off = Bin('*', T.u32, counter, Const(T.u32, 8));
+        const [ bits, val ] = nextKeyBits(length, Load('u32', pointer, 4));
         const kName = tmp(scope, T.jsval)[N_A], vName = tmp(scope, T.jsval)[N_A];
-        setLocalWithType(scope, kName, false, Load('jsval', Bin('+', T.u32, keysEnt, off), 0));
-        setLocalWithType(scope, vName, false, Load('jsval', Bin('+', T.u32, valsEnt, off), 0));
+        setLocalWithType(scope, kName, false, Call('porf_arr_unbits', [ bits ], T.jsval));
+        setLocalWithType(scope, vName, false, val);
         assign(scope, counter, Bin('+', T.i32, counter, Const(T.i32, 1)));
         return generate(scope, { type: 'ArrayExpression', elements: [ { type: 'Identifier', name: kName }, { type: 'Identifier', name: vName } ] });
       } ],
@@ -3666,7 +3675,7 @@ const generateForIn = (scope, decl) => {
       const objPtr = reuse(scope, JvPtr(Local(objName, T.jsval)));
       assign(scope, counter, Const(T.i32, 0));
       // one load of the shape word: entries pointer and size from the same moment
-      const shape = reuse(scope, Load('u64', objPtr, 0));
+      const shape = reuse(scope, Call('porf_obj_snap', [ objPtr ], T.u64));
       assign(scope, length, Convert(T.i32, Bin('&', T.i64, Bin('>>', T.i64, shape, Const(T.i64, 32)), Const(T.i64, 0xffff))));
       assign(scope, pointer, Convert(T.u32, Bin('&', T.i64, shape, Const(T.i64, 0xffffffff))));
 

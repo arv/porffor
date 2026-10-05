@@ -777,6 +777,33 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
     return JvConst(TYPES.undefined, 0);
   });
 
+  // a reentrant lock word at an address (see porf_rlock); no-ops without threads
+  comptime('__Porffor_rlock', TYPES.undefined, (scope, decl, { generate, exprStmt }) => {
+    exprStmt(scope, Call('porf_rlock', [ rawI32(generate(scope, decl.arguments[0])) ], T.none));
+    return JvConst(TYPES.undefined, 0);
+  });
+
+  comptime('__Porffor_runlock', TYPES.undefined, (scope, decl, { generate, exprStmt }) => {
+    exprStmt(scope, Call('porf_runlock', [ rawI32(generate(scope, decl.arguments[0])) ], T.none));
+    return JvConst(TYPES.undefined, 0);
+  });
+
+  // store a raw 8-byte word that racing readers may load (whole, see porf_obj_store_word).
+  // plain u64 stores stay plain: typed array elements are only 4-aligned
+  comptime('__Porffor_wordStore', TYPES.undefined, (scope, decl, { generate, exprStmt }) => {
+    const v = generate(scope, decl.arguments[1]);
+    const bits = v[N_TYPE] === T.u64 || v[N_TYPE] === T.i64 ? v : Convert(T.i64, rawNum(v), CONVERT_SIGNED);
+    exprStmt(scope, Call('porf_obj_store_word', [ rawI32(generate(scope, decl.arguments[0])), bits ], T.none));
+    return JvConst(TYPES.undefined, 0);
+  });
+
+  // read slot i once as its raw word (0 past the end), and turn such a word into a value
+  comptime('__Porffor_array_getBits', TYPES.number, (scope, decl, { generate }) =>
+    Call('porf_arr_get_bits', [ rawPtr(generate(scope, decl.arguments[0])), rawI32(generate(scope, decl.arguments[1])) ], T.u64));
+
+  comptime('__Porffor_array_fromBits', undefined, (scope, decl, { generate }) =>
+    Call('porf_arr_unbits', [ generate(scope, decl.arguments[0]) ], T.jsval));
+
   comptime('__Porffor_array_has', TYPES.boolean, (scope, decl, { generate }) =>
     Box(Call('porf_arr_has_own', [ rawPtr(generate(scope, decl.arguments[0])), rawI32(generate(scope, decl.arguments[1])) ], T.i32), Const(T.i32, TYPES.boolean)));
 

@@ -9,6 +9,7 @@ export const __Set_prototype_size$get = function (this: Set) {
 
 export const __Set_prototype_values = function (this: Set) {
   // todo: this should return an iterator not array
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   const keys: any[] = Porffor.IR.loadI32(this, 0);
   const keysEntries: i32 = Porffor.IR.loadI32(keys, 4);
   const out: any[] = Porffor.array.new(4);
@@ -19,6 +20,7 @@ export const __Set_prototype_values = function (this: Set) {
     Porffor.array.fastPush(out, keys[i]);
   }
 
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
   return out;
 };
 
@@ -27,26 +29,33 @@ export const __Set_prototype_keys = function (this: Set) {
 };
 
 export const __Set_prototype_has = function (this: Set, value: any) {
-  return __Porffor_hashtableLookup(this, value) != -1;
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
+  const found: boolean = __Porffor_hashtableLookup(this, value) != -1;
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
+  return found;
 };
 
 export const __Set_prototype_add = function (this: Set, value: any) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   if (__Porffor_hashtableLookup(this, value) == -1) {
     __Porffor_hashtableAppend(this, value);
   }
 
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
   return this;
 };
 
 export const __Set_prototype_delete = function (this: Set, value: any) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   const index: i32 = __Porffor_hashtableLookup(this, value);
-  if (index == -1) return false;
+  if (index != -1) __Porffor_hashtableTombstone(this, value, index);
 
-  __Porffor_hashtableTombstone(this, value, index);
-  return true;
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
+  return index != -1;
 };
 
 export const __Set_prototype_clear = function (this: Set) {
+  __Porffor_rlock(Porffor.IR.ptr(this) + 20);
   const keys: any[] = Porffor.IR.loadI32(this, 0);
   __Porffor_array_ensure(keys, 0);
   keys.length = 0;
@@ -54,6 +63,7 @@ export const __Set_prototype_clear = function (this: Set) {
   Porffor.IR.storeI32(this, 8, 0);
   Porffor.IR.storeI32(this, 12, 0);
   Porffor.IR.storeI32(this, 16, 0);
+  __Porffor_runlock(Porffor.IR.ptr(this) + 20);
 };
 
 export const __Set_prototype_forEach = function (this: Set, callbackFn: any, thisArg: any = undefined) {
