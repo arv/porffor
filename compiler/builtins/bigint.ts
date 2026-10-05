@@ -12,7 +12,8 @@ export const __Porffor_bigint_fromDigits = (negative: boolean, digits: i32[]): b
 
   let allZero: boolean = true;
   for (let i: i32 = 0; i < len; i++) {
-    const d: i32 = digits[i];
+    // digits may be given as u32s, wrap instead of saturating
+    const d: i32 = digits[i] | 0;
     if (d != 0) allZero = false;
 
     Porffor.IR.storeI32(ptr + i * 4, 4, d);
@@ -25,9 +26,11 @@ export const __Porffor_bigint_fromDigits = (negative: boolean, digits: i32[]): b
   return (ptr + 0x8000000000000) as bigint;
 };
 
+// bigints with |n| < 2^41 are stored inline, larger ones on the heap as ptr + 2^51.
+// the inline limit is what fits in a jsbits payload (see porf_pack)
 export const __Porffor_bigint_fromNumber = (n: number): bigint => {
   if (!Number.isInteger(n) || !Number.isFinite(n)) throw new RangeError('Cannot use non-integer as BigInt');
-  if (Math.abs(n) < 0x8000000000000) return n as bigint;
+  if (Math.abs(n) < 0x20000000000) return n as bigint;
 
   const negative: boolean = n < 0;
   n = Math.abs(n);
@@ -107,7 +110,7 @@ export const __Porffor_bigint_fromString = (n: string|bytestring): bigint => {
     acc = acc * radix + digit;
   }
 
-  if (acc < 0x8000000000000) {
+  if (acc < 0x20000000000) {
     // inline if small enough
     if (negative) acc = -acc;
     return acc as bigint;
@@ -115,7 +118,7 @@ export const __Porffor_bigint_fromString = (n: string|bytestring): bigint => {
 
   const result: i32[] = Porffor.array.new(digitLen);
   while (digits.length > 0) {
-    let carry: i32 = 0;
+    let carry: number = 0;
     for (let j: i32 = 0; j < digits.length; j++) {
       let value: number = carry * radix + digits[j];
       let quotient: i32 = Math.floor(value / BASE);

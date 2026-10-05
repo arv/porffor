@@ -20,12 +20,18 @@ export const __Porffor_hashSvz = (key: any): i32 => {
     return __Porffor_object_hash(key);
   }
 
-  if (t == Porffor.TYPES.number) {
-    if (key != key) return 0x7ff8;
-    if (key == 0) return 0;
+  if (Porffor.fastOr(t == Porffor.TYPES.number, t == Porffor.TYPES.bigint)) {
+    let n: number = key;
+    // bigints hash by value: equal heap bigints are separate allocations
+    if (Porffor.comptime.flag`hasType.bigint`) {
+      if (t == Porffor.TYPES.bigint) n = __Porffor_bigint_toNumber(key);
+    }
+
+    if (n != n) return 0x7ff8;
+    if (n == 0) return 0;
 
     // fold first: the identity path truncates f64 -> i32 saturating, sending every |key| >= 2^31 to one bucket
-    let hash: i32 = key % 2147483648;
+    let hash: i32 = n % 2147483648;
     hash ^= hash >>> 16;
     hash *= 0x7feb352d;
     hash ^= hash >>> 15;

@@ -652,7 +652,7 @@ return porf_box((f64)dst, ${TYPES.string});`, false) ]
     body: [ RawC(`u64 ux = (u64)x;
 u32 hi = (u32)(ux >> 32);
 u32 lo = (u32)ux;
-if (hi < 0x80000u) return porf_box((f64)ux, ${TYPES.bigint});
+if (hi < 0x200u) return porf_box((f64)ux, ${TYPES.bigint});
 u32 ptr = porf_alloc(16, ${TYPES.bigint});
 *(u8*)(MEM + ptr) = 0;
 *(u16*)(MEM + ptr + 2) = 2;
@@ -669,7 +669,7 @@ return porf_box((f64)ptr + 2251799813685248.0, ${TYPES.bigint});`, false) ]
 u64 ax = (u64)((x ^ signBits) - signBits);
 u32 hi = (u32)(ax >> 32);
 u32 lo = (u32)ax;
-if (hi < 0x80000u) return porf_box((f64)x, ${TYPES.bigint});
+if (hi < 0x200u) return porf_box((f64)x, ${TYPES.bigint});
 u32 ptr = porf_alloc(16, ${TYPES.bigint});
 *(u8*)(MEM + ptr) = x != (i64)ax;
 *(u16*)(MEM + ptr + 2) = 2;

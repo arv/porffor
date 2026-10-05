@@ -3851,6 +3851,15 @@ static void porf_gc_process_weakmaps(void) {
 }
 
 static void porf_gc_cons_candidate(u32 c);
+// a jsval payload as f64: a pointer, or a heap bigint (ptr + 2^51)
+static void porf_gc_cons_f64(f64 d) {
+  if (d > 0.0 && d < 4294967296.0) {
+    const i64 iv = (i64)d;
+    if ((f64)iv == d) porf_gc_cons_candidate((u32)(u64)iv);
+  } else if (d >= 2251799813685248.0 && d < 2251804108652544.0) {
+    porf_gc_cons_candidate((u32)(d - 2251799813685248.0));
+  }
+}
 static void porf_gc_cons_mark_block(i32 body) {
   if (!porf_gc_mark_body(body)) return;
   const u32 kind = porf_gc_kinds[porf_gc_gran(body)];
@@ -3859,13 +3868,7 @@ static void porf_gc_cons_mark_block(i32 body) {
   if (porf_gc_array_like_shape_valid(body)) { porf_gc_enqueue_mark(body, ${TYPES.array}); return; }
   const u32 size = porf_gc_block_size(body);
   for (u32 off = 0; off + 4u <= size; off += 4u) porf_gc_cons_candidate(*(u32*)(MEM + body + off));
-  for (u32 off = 0; off + 8u <= size; off += 8u) {
-    const f64 d = *(f64*)(MEM + body + off);
-    if (d > 0.0 && d < 4294967296.0) {
-      const i64 iv = (i64)d;
-      if ((f64)iv == d) porf_gc_cons_candidate((u32)(u64)iv);
-    }
-  }
+  for (u32 off = 0; off + 8u <= size; off += 8u) porf_gc_cons_f64(*(f64*)(MEM + body + off));
 }
 static void porf_gc_cons_candidate(u32 c) {
   if (c < porf_heap_base || c >= porf_heap_top) return;
@@ -3899,10 +3902,7 @@ static void porf_gc_cons_scan_range(const u64* lo, const u64* hi) {
     }
     f64 d;
     memcpy(&d, w, 8);
-    if (d > 0.0 && d < 4294967296.0) {
-      const i64 iv = (i64)d;
-      if ((f64)iv == d) porf_gc_cons_candidate((u32)(u64)iv);
-    }
+    porf_gc_cons_f64(d);
   }
 }
 
@@ -4332,9 +4332,6 @@ ${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next)
 `;
 };
 
-// jsval encoding: f64 numbers are themselves, else 0xFFF8 (sign + quiet-NaN) << 48 |
-// type:8 << 43 | payload:32. hardware qNaN is 0x7FF8 (sign clear) so never collides,
-// sign-set NaNs from raw bytes are canonicalized at Float64Array/DataView reads (porf_canon)
 // shared-memory threads: per-thread runtime state and the stop-the-world protocol.
 // the state lives in plain memory (not TLS) so a collecting thread can reach every
 // other thread's roots through the registry; the old global names become macros
@@ -4602,6 +4599,11 @@ static void porf_threads_finish(void) {
 `;
 };
 
+// jsval encoding: f64 numbers are themselves, else 0xFFF8 (sign + quiet-NaN) << 48 |
+// type:8 << 43 | payload:32. hardware qNaN is 0x7FF8 (sign clear) so never collides,
+// sign-set NaNs from raw bytes are canonicalized at Float64Array/DataView reads (porf_canon).
+// bigints use all 43 payload bits: bit 42 set = heap (ptr in low 32 bits), else the inline
+// value as 42-bit two's complement (so inline bigints are limited to |n| < 2^41)
 const RUNTIME_HEAD = (prefs, toStr = null, iterClose = null, threads = false) => {
   const st = 'static ';
   const sti = 'static inline ';
@@ -4695,6 +4697,7 @@ ${threads ? THREAD_HEAD() : '#define porf_builtin_lock() ((void)0)\n#define porf
 #define JV_UNDEFINED_BITS (JV_PATTERN | ((u64)${TYPES.undefined} << 43))
 #define JV_UNDEFINED ((jsval){0.0, ${TYPES.undefined}})
 #define JV_ZERO_BITS (JV_PATTERN | ((u64)${TYPES.number} << 43))
+#define JV_BIGINT_HEAP 0x40000000000ull
 
 #define PORF_PROMISE_RESULT 0
 #define PORF_PROMISE_FULFILL_HEAD 8
@@ -4737,6 +4740,9 @@ static inline jsbits porf_pack(jsval v) {
     // negative quiet NaNs collide with the boxed encoding: canonicalize
     return (b & JV_PATTERN) == JV_PATTERN ? 0x7FF8000000000000ull : b;
   }
+  if (v.type == ${TYPES.bigint}) return JV_PATTERN | ((u64)${TYPES.bigint} << 43) | (v.val >= 2251799813685248.0
+    ? JV_BIGINT_HEAP | (u64)(u32)(v.val - 2251799813685248.0)
+    : (u64)(i64)v.val & (JV_BIGINT_HEAP - 1));
   return JV_PATTERN | ((u64)(v.type & 0xFF) << 43) | (u64)(u32)v.val;
 }
 ${sti}jsbits porf_arr_pack(jsval v) {
@@ -4745,7 +4751,11 @@ ${sti}jsbits porf_arr_pack(jsval v) {
 }
 static inline jsval porf_unpack(jsbits b) {
   if ((b & JV_PATTERN) != JV_PATTERN) return porf_box_num(porf_bits_to_f64(b));
-  return (jsval){(f64)(u32)b, (i32)((b >> 43) & 0xFF)};
+  const i32 type = (i32)((b >> 43) & 0xFF);
+  if (type == ${TYPES.bigint}) return (jsval){b & JV_BIGINT_HEAP
+    ? 2251799813685248.0 + (f64)(u32)b
+    : (f64)((i64)(b << 22) >> 22), type};
+  return (jsval){(f64)(u32)b, type};
 }
 static inline f64 porf_canon(f64 d) { return d == d ? d : porf_bits_to_f64(0x7FF8000000000000ull); }
 
@@ -5313,15 +5323,17 @@ ${sti}i32 porf_loose_eq(jsval a, jsval b) {
     return a.val == 0.0 && ((u32)b.val == 0u || *(u32*)(MEM + (u32)b.val) == 0u);
   if (ta == ${TYPES.boolean}) return porf_loose_eq(porf_box_num((f64)(u32)a.val), b);
   if (tb == ${TYPES.boolean}) return porf_loose_eq(a, porf_box_num((f64)(u32)b.val));
+  if (ta == ${TYPES.bigint} && tb == ${TYPES.bigint}) return porf_bigint_cmp(a, b) == 0;
   return porf_jv_eq(a, b);
 }
 
-// === : numbers as f64, strings by content, else identity
+// === : numbers as f64, strings and bigints by content, else identity
 ${sti}i32 porf_strict_eq(jsval a, jsval b) {
   if (porf_jv_is_num(a)) return porf_jv_is_num(b) && a.val == b.val;
   const i32 ta = porf_jv_type(a), tb = porf_jv_type(b);
   if ((ta == ${TYPES.bytestring} || ta == ${TYPES.string}) && (tb == ${TYPES.bytestring} || tb == ${TYPES.string})) return porf_str_eq(a, b);
   if (ta != tb) return 0;
+  if (ta == ${TYPES.bigint}) return porf_bigint_cmp(a, b) == 0;
   return (u32)a.val == (u32)b.val;
 }
 
