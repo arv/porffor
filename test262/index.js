@@ -827,6 +827,79 @@ if (cluster.isPrimary) {
 
   if (fs.existsSync(harnessPath)) loadHarness(harnessPath);
 
+  // tests using $262.agent get agents as threads (agent.js): its host replaces the throwing
+  // getter, and each $262.agent.start(`source`) becomes $262.agent.start(__agent => { source })
+  // with $262.agent in it as __agent, as porffor compiles ahead of time. a host splices each
+  // ${expr} in as source text: one naming a const initialized to a literal is spliced so too
+  // (a string can be code, eg "42n"); anything else is evaluated at the start call (agents
+  // often use a loop variable) and passed in, standing where the text would have been
+  const agentGetter = "  get agent() {\n    throw new Error('$262.agent is unsupported');\n    return null;\n  }";
+  if (!preludes['#host'].includes(agentGetter)) throw new Error('test262/harness.js: $262.agent getter not found');
+  const agentHost = fs.readFileSync(join(__dirname, 'agent.js'), 'utf8') + preludes['#host'].replace(agentGetter, () => '  agent: __porfAgent');
+  const usesAgent = test => /\$262\.agent\b/.test(test.body) || test.prefix.includes('$262.agent.waitUntil');
+  const agentify = (contents, body) => {
+    // the test's own (the harness has examples in comments)
+    const literalConsts = new Map();
+    for (const m of body.matchAll(/\bconst ([A-Za-z_$][\w$]*) = (-?\d+(?:\.\d+)?|"[^"\\\n]*"|'[^'\\\n]*');/g))
+      literalConsts.set(m[1], /^['"]/.test(m[2]) ? m[2].slice(1, -1) : m[2]);
+    const marker = '$262.agent.start(';
+    let out = '', i = 0;
+    while (true) {
+      const at = contents.indexOf(marker, i);
+      if (at === -1) break;
+      let j = at + marker.length;
+      while (/\s/.test(contents[j])) j++;
+      const q = contents[j];
+      if (q !== '`' && q !== "'" && q !== '"') {
+        out += contents.slice(i, j);
+        i = j;
+        continue;
+      }
+
+      // the source literal, cooked enough for agent code: escapes, and ${expr} as an argument
+      let k = j + 1, src = '';
+      const args = [];
+      while (k < contents.length && contents[k] !== q) {
+        const c = contents[k];
+        if (c === '\\') {
+          const n = contents[k + 1];
+          src += n === 'n' ? '\n' : n === 't' ? '\t' : n;
+          k += 2;
+          continue;
+        }
+        if (q === '`' && c === '$' && contents[k + 1] === '{') {
+          let depth = 1, e = k + 2;
+          while (depth > 0 && e < contents.length) {
+            if (contents[e] === '{') depth++;
+              else if (contents[e] === '}') depth--;
+            e++;
+          }
+          const expr = contents.slice(k + 2, e - 1).trim();
+          if (literalConsts.has(expr)) {
+            src += literalConsts.get(expr);
+          } else {
+            src += '__agentArg' + args.length;
+            args.push(expr);
+          }
+          k = e;
+          continue;
+        }
+        src += c;
+        k++;
+      }
+      const fn = '__agent => {' + src.replaceAll('$262.agent', '__agent') + '\n}';
+      out += contents.slice(i, at) + marker + (args.length === 0 ? fn
+        : `((${args.map((_, n) => '__agentArg' + n).join(', ')}) => ${fn})(${args.map(x => '(' + x + ')').join(', ')})`);
+      i = k + 1;
+    }
+    out += contents.slice(i);
+    // a built-in constructor's own data properties read through a variable are undefined in
+    // porffor (only Int32Array.BYTES_PER_ELEMENT spelled out is folded), and safeBroadcast
+    // reads it so. it takes only Int32Array and BigInt64Array
+    out = out.replace('new SharedArrayBuffer(Constructor.BYTES_PER_ELEMENT)', () => 'new SharedArrayBuffer(Constructor === Int32Array ? 4 : 8)');
+    return out.replace(preludes['#host'], () => agentHost);
+  };
+
   // fast harness: strip expensive formatting from upstream assert.js failure
   // messages. message TEXT only - comparison semantics, thrown error types and
   // control flow are untouched, so test results cannot change. harness/ self-
@@ -1065,7 +1138,7 @@ if (cluster.isPrimary) {
     }
 
     let t = performance.now();
-    const comp = await execAsync(cc[0], [ ...cc.slice(1), ...(cc.some(x => x.startsWith('-O')) ? [] : [ '-O0' ]), ...(process.platform === 'darwin' ? [ '-Wl,-stack_size,0x4000000' ] : []), '-w', '-xc', tmpC, '-o', tmpBin, '-lm' ], null);
+    const comp = await execAsync(cc[0], [ ...cc.slice(1), ...(cc.some(x => x.startsWith('-O')) ? [] : [ '-O0' ]), ...(process.platform === 'darwin' ? [ '-Wl,-stack_size,0x4000000' ] : []), '-w', '-xc', tmpC, '-o', tmpBin, '-lm', '-pthread' ], null);
     if (comp.status !== 0) return { ...comp, stdout: '', nativeCompileError: !comp.timedOut, compileTime: performance.now() - t };
     const compileTime = performance.now() - t;
 
@@ -1132,6 +1205,7 @@ if (cluster.isPrimary) {
     };
 
     let contents = test.contents;
+    if (usesAgent(test)) contents = agentify(contents, test.body);
     if (debugAsserts) contents = contents
       .replace('var assert = mustBeTrue => {', 'var assert = (mustBeTrue, msg) => {')
       .replaceAll('(actual, expected) => {', '(actual, expected, msg) => {')
