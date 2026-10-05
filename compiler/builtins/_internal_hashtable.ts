@@ -87,7 +87,9 @@ export const __Porffor_hashtableRebuild = (container: any, newCapacity: any): vo
   Porffor.IR.fill(buckets, 0, capacity * 4);
   Porffor.IR.storeI32(container, 8, buckets);
   Porffor.IR.storeI32(container, 12, capacity);
-  Porffor.IR.gcBarrier(container, Porffor.type(container));
+  // only dirty the card: hashtableNew set the gc kind, and WeakMap/WeakSet call in
+  // reboxed as Map/Set, so retagging here would make the gc scan them as strong
+  Porffor.IR.gcBarrier(container, 0);
 
   const keys: any[] = Porffor.IR.loadI32(container, 0);
   const keysEntries: i32 = Porffor.IR.loadI32(keys, 4);
