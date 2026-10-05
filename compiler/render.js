@@ -1581,6 +1581,8 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     linkProtos.push(`${st}jsval __Porffor_coroutine_value(jsval gen);\n`);
     linkProtos.push(`${st}i32 __Porffor_coroutine_raw(jsval gen);\n`);
     linkProtos.push(`${st}i32 __Porffor_coroutine_awaiting(jsval gen);\n`);
+    linkProtos.push(`${st}i32 __Porffor_coroutine_enqueue(jsval gen, jsval value, i32 mode, jsval promise);\n`);
+    linkProtos.push(`${st}jsval __Porffor_coroutine_dequeue(jsval gen);\n`);
     linkProtos.push(`${st}void __Porffor_coroutine_setRaw(i32 raw);\n`);
   }
   if (!split) {
@@ -1901,6 +1903,51 @@ ${usesThreads ? '  if (porf_ts->coro_gen == (u32)gen.val) return porf_ts->coro_r
 
 ${st}i32 __Porffor_coroutine_awaiting(jsval gen) {
   return porf_coro_unbox(gen)->awaiting;
+}
+
+// async generators take next/throw/return requests in turn: one runs at a time, across its
+// awaits too, so one arriving meanwhile (from any thread) waits for it instead of resuming the
+// body at an await. requests queue as flat [mode, value, promise] from aq_head, under aq_lock.
+// 1 when none was running: the caller runs this one, and the queue after it
+${st}i32 __Porffor_coroutine_enqueue(PORF_ROOT jsval gen, PORF_ROOT jsval value, i32 mode, PORF_ROOT jsval promise) {
+  porf_coro_call* call = porf_coro_unbox(gen);
+  const u32 lock = (u32)((u8*)&call->aq_lock - MEM);
+  porf_rlock(lock);
+  if (call->aq == 0) {
+    call->aq = porf_arr_new(0, 6);
+    porf_coro_touch(call);
+  }
+  (void)porf_arr_push(call->aq, porf_box_num((f64)mode));
+  (void)porf_arr_push(call->aq, value);
+  (void)porf_arr_push(call->aq, promise);
+  const i32 start = !call->aq_active;
+  call->aq_active = 1;
+  porf_runlock(lock);
+  return start;
+}
+
+// the next request as [mode, value, promise], or undefined once none is left: then none runs
+${st}jsval __Porffor_coroutine_dequeue(PORF_ROOT jsval gen) {
+  porf_coro_call* call = porf_coro_unbox(gen);
+  const u32 lock = (u32)((u8*)&call->aq_lock - MEM);
+  porf_rlock(lock);
+  const u32 q = call->aq;
+  if (q == 0 || call->aq_head >= PORF_ARR_LEN_LOAD(q)) {
+    if (q != 0) porf_arr_set_len(q, 0);
+    call->aq_head = 0;
+    call->aq_active = 0;
+    porf_runlock(lock);
+    return JV_UNDEFINED;
+  }
+  PORF_ROOT const u32 out = porf_arr_new(3, 3);
+  for (u32 i = 0; i < 3; i++) {
+    const u32 at = (u32)call->aq_head + i;
+    porf_arr_set(out, i, porf_arr_get(q, at));
+    porf_arr_set(q, at, JV_UNDEFINED);
+  }
+  call->aq_head += 3;
+  porf_runlock(lock);
+  return porf_box((f64)out, ${TYPES.array});
 }
 
 ${st}void __Porffor_coroutine_setRaw(i32 raw) {
@@ -5973,6 +6020,10 @@ typedef struct porf_coro_call {
   i32 awaiting;           // suspended at an await (channel is its promise), not a yield
   i32 caller_iter_base;
   i32 busy;               // claimed by a thread resuming it (with threads)
+  u32 aq;                 // async generators: requests waiting their turn, see __Porffor_coroutine_enqueue
+  i32 aq_head;
+  i32 aq_active;          // a request is running (perhaps waiting at an await)
+  u32 aq_lock;
 } porf_coro_call;
 #define PORF_CORO_HDR ((u32)((sizeof(porf_coro_call) + 7u) & ~7u))
 #define PORF_CORO_BYTES(frame, argc) (PORF_CORO_HDR + (frame) + (u32)(argc) * 8u)
@@ -6099,6 +6150,10 @@ static void porf_coro_init(porf_coro_call* c, u32 heap, u32 frame, u32 idx, jsva
   c->argc = argc;
   c->state = 0;
   c->busy = 0;
+  c->aq = 0;
+  c->aq_head = 0;
+  c->aq_active = 0;
+  c->aq_lock = porf_self_tag();
   c->resume = 0;
   c->throw_pending = 0;
   c->raw = 0;
@@ -6158,6 +6213,7 @@ static void porf_coro_gc_scan(porf_coro_call* call) {
   porf_gc_mark_js(call->result.val, call->result.type);
   porf_gc_mark_js(call->channel.val, call->channel.type);
   porf_gc_mark_js(call->iter_open.val, call->iter_open.type);
+  if (call->aq != 0) porf_gc_mark_js((f64)call->aq, ${TYPES.array});
   if (call->state == 1) porf_gc_mark_js(call->caller_iter_open.val, call->caller_iter_open.type);
   const jsbits* argv = porf_coro_argv(call);
   for (i32 i = 0; i < call->argc; i++) porf_gc_mark_jsbits(argv[i]);

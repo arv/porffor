@@ -1877,7 +1877,7 @@ const generateCall = (scope, decl) => {
 
   if (name?.startsWith('__Porffor_coroutine_'))
     return Call(name, decl.arguments.map(a => generate(scope, a)),
-      name === '__Porffor_coroutine_value' ? T.jsval : name === '__Porffor_coroutine_setRaw' ? T.none : T.i32);
+      name === '__Porffor_coroutine_value' || name === '__Porffor_coroutine_dequeue' ? T.jsval : name === '__Porffor_coroutine_setRaw' ? T.none : T.i32);
 
   // eval('known/literal string') -> inline the parsed program
   if (!decl._funcIdx && !decl._new && (name === 'eval' || (decl.callee.type === 'SequenceExpression' && decl.callee.expressions.at(-1)?.name === 'eval'))) {

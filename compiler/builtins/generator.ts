@@ -285,20 +285,40 @@ export const __Porffor_iterator_complete = (rec: any[], res: any): any => {
 
 export const __Porffor_AsyncGenerator_step = (gen: __Porffor_AsyncGenerator, value: any, mode: i32): Promise => {
   const promise: Promise = __Porffor_promise_create();
-  __Porffor_AsyncGenerator_run(gen, value, mode, promise);
+  // requests run in turn (see __Porffor_coroutine_enqueue): start draining unless one runs
+  if (Porffor.coroutine.enqueue(gen, value, mode, promise)) __Porffor_AsyncGenerator_drain(gen);
   return promise;
 };
 
-// resume until the body yields or finishes, following its awaits
-export const __Porffor_AsyncGenerator_run = (gen: __Porffor_AsyncGenerator, value: any, mode: i32, promise: Promise): void => {
+// run the queued requests in turn, until one goes on asynchronously (it drains again once it
+// completes) or none is left
+export const __Porffor_AsyncGenerator_drain = (gen: __Porffor_AsyncGenerator): void => {
+  while (true) {
+    const req: any = Porffor.coroutine.dequeue(gen);
+    if (Porffor.type(req) != Porffor.TYPES.array) return;
+    const r: any[] = req;
+    const mode: i32 = r[0];
+    if (!__Porffor_AsyncGenerator_run(gen, r[1], mode, r[2])) return;
+  }
+};
+
+// resume until the body yields or finishes, following its awaits. 1 when the request is done
+// (its promise settled), 0 when it goes on asynchronously
+export const __Porffor_AsyncGenerator_run = (gen: __Porffor_AsyncGenerator, value: any, mode: i32, promise: Promise): i32 => {
   try {
     const done: boolean = Porffor.coroutine.resume(gen, value, mode);
     const yielded: any = Porffor.coroutine.value(gen);
     if (Porffor.coroutine.awaiting(gen)) {
       Porffor.callThis(__Promise_prototype_then, yielded,
-        (v: any): void => __Porffor_AsyncGenerator_run(gen, v, 0, promise),
-        (e: any): void => __Porffor_AsyncGenerator_run(gen, e, 1, promise));
-    } else if (Porffor.type(yielded) == Porffor.TYPES.promise) {
+        (v: any): void => {
+          if (__Porffor_AsyncGenerator_run(gen, v, 0, promise)) __Porffor_AsyncGenerator_drain(gen);
+        },
+        (e: any): void => {
+          if (__Porffor_AsyncGenerator_run(gen, e, 1, promise)) __Porffor_AsyncGenerator_drain(gen);
+        });
+      return 0;
+    }
+    if (Porffor.type(yielded) == Porffor.TYPES.promise) {
       // the yielded value is itself awaited: settle with { value: awaited, done }
       Porffor.callThis(__Promise_prototype_then, yielded,
         (v: any): void => {
@@ -306,20 +326,23 @@ export const __Porffor_AsyncGenerator_run = (gen: __Porffor_AsyncGenerator, valu
           result.value = v;
           result.done = done;
           __Porffor_promise_resolve(result, promise);
+          __Porffor_AsyncGenerator_drain(gen);
         },
         (e: any): void => {
           Porffor.coroutine.resume(gen, undefined, 2 as i32);
           __Porffor_promise_reject(e, promise);
+          __Porffor_AsyncGenerator_drain(gen);
         });
-    } else {
-      const result: object = {};
-      result.value = yielded;
-      result.done = done;
-      __Porffor_promise_resolve(result, promise);
+      return 0;
     }
+    const result: object = {};
+    result.value = yielded;
+    result.done = done;
+    __Porffor_promise_resolve(result, promise);
   } catch (e) {
     __Porffor_promise_reject(e, promise);
   }
+  return 1;
 };
 
 export const __Porffor_AsyncGenerator_prototype_next = function (this: __Porffor_AsyncGenerator, value: any) {
