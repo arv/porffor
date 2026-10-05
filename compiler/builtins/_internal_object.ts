@@ -859,6 +859,10 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
     return value;
   }
 
+  // with threads: the shape this lookup sees (see porf_obj_add_fast)
+  const objRaw: i32 = Porffor.IR.ptr(obj);
+  let shapeSeen: i64 = 0;
+  Porffor.c`shapeSeen = PORF_THREADED ? (i64)porf_obj_snap((u32)objRaw) : 0;`;
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   let flags: i32;
   if (entryPtr == 0) {
@@ -930,10 +934,32 @@ export const __Porffor_object_set = (_obj: any, key: any, value: any): any => {
     flags = tail & 0xff;
   }
 
-  // without threads nothing can move an existing entry, so write it in place
+  // without threads nothing can move an existing entry, so write it in place. with them an
+  // entry still in the live block, with the flags seen, is written under the lock right here
   let threaded: i32 = 0;
   Porffor.c`threaded = PORF_THREADED;`;
   if (Porffor.fastOr(threaded, entryPtr == 0)) {
+    if (entryPtr != 0) {
+      const o: i32 = Porffor.IR.ptr(obj);
+      const keyRaw: i32 = Porffor.IR.ptr(key);
+      const keyType: i32 = Porffor.type(key);
+      let stored: i32 = 0;
+      Porffor.c`stored = porf_obj_store_live((u32)o, (u32)entryPtr, (u32)hash, (u32)keyRaw, (u32)keyType, (u32)flags, porf_pack(value));`;
+      if (stored) {
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+        return value;
+      }
+    } else {
+      const keyRaw: i32 = Porffor.IR.ptr(key);
+      const keyType: i32 = Porffor.type(key);
+      let added: i32 = 0;
+      Porffor.c`added = porf_obj_add_fast((u32)objRaw, (u64)shapeSeen, (u32)hash, (u32)keyRaw, (u32)keyType, (u32)flags, porf_pack(value));`;
+      if (added) {
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, key);
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+        return value;
+      }
+    }
     if (__Porffor_object_commit(obj, entryPtr, key, hash, entryPtr == 0 ? -1 : flags, flags, value, undefined, undefined)) return __Porffor_object_set(_obj, key, value);
     return value;
   }
@@ -959,6 +985,10 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
     return value;
   }
 
+  // with threads: the shape this lookup sees (see porf_obj_add_fast)
+  const objRaw: i32 = Porffor.IR.ptr(obj);
+  let shapeSeen: i64 = 0;
+  Porffor.c`shapeSeen = PORF_THREADED ? (i64)porf_obj_snap((u32)objRaw) : 0;`;
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   let flags: i32;
   if (entryPtr == 0) {
@@ -1024,10 +1054,32 @@ export const __Porffor_object_set_withHash = (_obj: any, key: any, value: any, h
     flags = tail & 0xff;
   }
 
-  // without threads nothing can move an existing entry, so write it in place
+  // without threads nothing can move an existing entry, so write it in place. with them an
+  // entry still in the live block, with the flags seen, is written under the lock right here
   let threaded: i32 = 0;
   Porffor.c`threaded = PORF_THREADED;`;
   if (Porffor.fastOr(threaded, entryPtr == 0)) {
+    if (entryPtr != 0) {
+      const o: i32 = Porffor.IR.ptr(obj);
+      const keyRaw: i32 = Porffor.IR.ptr(key);
+      const keyType: i32 = Porffor.type(key);
+      let stored: i32 = 0;
+      Porffor.c`stored = porf_obj_store_live((u32)o, (u32)entryPtr, (u32)hash, (u32)keyRaw, (u32)keyType, (u32)flags, porf_pack(value));`;
+      if (stored) {
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+        return value;
+      }
+    } else {
+      const keyRaw: i32 = Porffor.IR.ptr(key);
+      const keyType: i32 = Porffor.type(key);
+      let added: i32 = 0;
+      Porffor.c`added = porf_obj_add_fast((u32)objRaw, (u64)shapeSeen, (u32)hash, (u32)keyRaw, (u32)keyType, (u32)flags, porf_pack(value));`;
+      if (added) {
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, key);
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+        return value;
+      }
+    }
     if (__Porffor_object_commit(obj, entryPtr, key, hash, entryPtr == 0 ? -1 : flags, flags, value, undefined, undefined)) return __Porffor_object_set_withHash(_obj, key, value, hash);
     return value;
   }
@@ -1065,6 +1117,10 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
     return value;
   }
 
+  // with threads: the shape this lookup sees (see porf_obj_add_fast)
+  const objRaw: i32 = Porffor.IR.ptr(obj);
+  let shapeSeen: i64 = 0;
+  Porffor.c`shapeSeen = PORF_THREADED ? (i64)porf_obj_snap((u32)objRaw) : 0;`;
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   let flags: i32;
   if (entryPtr == 0) {
@@ -1137,10 +1193,32 @@ export const __Porffor_object_setStrict = (_obj: any, key: any, value: any): any
     flags = tail & 0xff;
   }
 
-  // without threads nothing can move an existing entry, so write it in place
+  // without threads nothing can move an existing entry, so write it in place. with them an
+  // entry still in the live block, with the flags seen, is written under the lock right here
   let threaded: i32 = 0;
   Porffor.c`threaded = PORF_THREADED;`;
   if (Porffor.fastOr(threaded, entryPtr == 0)) {
+    if (entryPtr != 0) {
+      const o: i32 = Porffor.IR.ptr(obj);
+      const keyRaw: i32 = Porffor.IR.ptr(key);
+      const keyType: i32 = Porffor.type(key);
+      let stored: i32 = 0;
+      Porffor.c`stored = porf_obj_store_live((u32)o, (u32)entryPtr, (u32)hash, (u32)keyRaw, (u32)keyType, (u32)flags, porf_pack(value));`;
+      if (stored) {
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+        return value;
+      }
+    } else {
+      const keyRaw: i32 = Porffor.IR.ptr(key);
+      const keyType: i32 = Porffor.type(key);
+      let added: i32 = 0;
+      Porffor.c`added = porf_obj_add_fast((u32)objRaw, (u64)shapeSeen, (u32)hash, (u32)keyRaw, (u32)keyType, (u32)flags, porf_pack(value));`;
+      if (added) {
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, key);
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+        return value;
+      }
+    }
     if (__Porffor_object_commit(obj, entryPtr, key, hash, entryPtr == 0 ? -1 : flags, flags, value, undefined, undefined)) return __Porffor_object_setStrict(_obj, key, value);
     return value;
   }
@@ -1166,6 +1244,10 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
     return value;
   }
 
+  // with threads: the shape this lookup sees (see porf_obj_add_fast)
+  const objRaw: i32 = Porffor.IR.ptr(obj);
+  let shapeSeen: i64 = 0;
+  Porffor.c`shapeSeen = PORF_THREADED ? (i64)porf_obj_snap((u32)objRaw) : 0;`;
   let entryPtr: i32 = __Porffor_object_lookup(obj, key, hash);
   let flags: i32;
   if (entryPtr == 0) {
@@ -1232,10 +1314,32 @@ export const __Porffor_object_setStrict_withHash = (_obj: any, key: any, value: 
     flags = tail & 0xff;
   }
 
-  // without threads nothing can move an existing entry, so write it in place
+  // without threads nothing can move an existing entry, so write it in place. with them an
+  // entry still in the live block, with the flags seen, is written under the lock right here
   let threaded: i32 = 0;
   Porffor.c`threaded = PORF_THREADED;`;
   if (Porffor.fastOr(threaded, entryPtr == 0)) {
+    if (entryPtr != 0) {
+      const o: i32 = Porffor.IR.ptr(obj);
+      const keyRaw: i32 = Porffor.IR.ptr(key);
+      const keyType: i32 = Porffor.type(key);
+      let stored: i32 = 0;
+      Porffor.c`stored = porf_obj_store_live((u32)o, (u32)entryPtr, (u32)hash, (u32)keyRaw, (u32)keyType, (u32)flags, porf_pack(value));`;
+      if (stored) {
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+        return value;
+      }
+    } else {
+      const keyRaw: i32 = Porffor.IR.ptr(key);
+      const keyType: i32 = Porffor.type(key);
+      let added: i32 = 0;
+      Porffor.c`added = porf_obj_add_fast((u32)objRaw, (u64)shapeSeen, (u32)hash, (u32)keyRaw, (u32)keyType, (u32)flags, porf_pack(value));`;
+      if (added) {
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, key);
+        Porffor.IR.gcBarrierValue(obj, Porffor.TYPES.object, value);
+        return value;
+      }
+    }
     if (__Porffor_object_commit(obj, entryPtr, key, hash, entryPtr == 0 ? -1 : flags, flags, value, undefined, undefined)) return __Porffor_object_setStrict_withHash(_obj, key, value, hash);
     return value;
   }

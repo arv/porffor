@@ -5051,11 +5051,47 @@ static inline void porf_obj_lock(u32 o) {
   if (__builtin_expect(!__atomic_compare_exchange_n(l, &z, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED), 0)) porf_obj_lock_slow(l);
 }
 static inline void porf_obj_unlock(u32 o) { __atomic_store_n((u32*)(MEM + o + 20), 0u, __ATOMIC_RELEASE); }
+// the common write: the entry is still in the live block (no grow or delete moved it) with
+// the flags the caller decided on, so only its value word changes. 0: take the general
+// path (__Porffor_object_commit)
+static inline int porf_obj_store_live(u32 o, u32 e, u32 hash, u32 key, u32 key_type, u32 flags, jsbits w) {
+  porf_obj_lock(o);
+  const u64 s = porf_obj_snap(o);
+  const u32 ent = (u32)s, size = (u32)(u16)(s >> 32);
+  const int live = e >= ent && e < ent + size * 24u && (e - ent) % 24u == 0 &&
+    *(u32*)(MEM + e) == hash && *(u32*)(MEM + e + 4) == key && *(u8*)(MEM + e + 18) == key_type && *(u8*)(MEM + e + 16) == flags;
+  if (live) porf_st_bits(MEM + e + 8, w);
+  porf_obj_unlock(o);
+  return live;
+}
+// the common add: the shape the caller's lookup saw is still current (nothing was added or
+// removed since, so the key is still absent) and there is room, so the entry goes straight
+// into the next slot. 0: take the general path
+static inline int porf_obj_add_fast(u32 o, u64 seen, u32 hash, u32 key, u32 key_type, u32 flags, jsbits w) {
+  porf_obj_lock(o);
+  const u64 s = porf_obj_snap(o);
+  const u32 ent = (u32)s, size = (u32)(u16)(s >> 32), cap = (u32)(u16)(s >> 48);
+  if (s != seen || size >= cap || (*(u8*)(MEM + o + 16) & 1u)) {
+    porf_obj_unlock(o);
+    return 0;
+  }
+  const u32 e = ent + size * 24u;
+  *(u32*)(MEM + e) = hash;
+  *(u32*)(MEM + e + 4) = key;
+  *(u8*)(MEM + e + 18) = (u8)key_type;
+  *(u8*)(MEM + e + 16) = (u8)flags;
+  porf_st_bits(MEM + e + 8, w);
+  porf_obj_publish(o, PORF_OBJ_SHAPE(ent, size + 1u, cap));
+  porf_obj_unlock(o);
+  return 1;
+}
 ` : `static inline u64 porf_obj_snap(u32 o) { return *(u64*)(MEM + o); }
 static inline void porf_obj_publish(u32 o, u64 shape) { *(u64*)(MEM + o) = shape; }
 static inline void porf_obj_store_word(u32 p, u64 w) { *(u64*)(MEM + p) = w; }
 #define porf_obj_lock(o) ((void)0)
 #define porf_obj_unlock(o) ((void)0)
+#define porf_obj_store_live(o, e, hash, key, key_type, flags, w) 0
+#define porf_obj_add_fast(o, seen, hash, key, key_type, flags, w) 0
 `}
 ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 
