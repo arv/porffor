@@ -350,6 +350,10 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
   const threadGlobals = usesThreads ? globals.filter(g => g.builtin && !sharedBuiltinGlobal(g.name)) : [];
   const threadGlobalSet = new Set(threadGlobals.map(g => g.name));
   const gname = name => threadGlobalSet.has(name) ? `porf_ts->tg->${sanitize(name)}` : sanitize(name);
+  // jsval globals every thread shares live as one packed word, so racing writes never tear
+  const globalTypeMap = new Map(globals.map(g => [ g.name, g.type ]));
+  const packedGlobal = name => usesThreads && !threadGlobalSet.has(name) && globalTypeMap.get(name) === T.jsval;
+  const globalAssign = (name, value) => packedGlobal(name) ? `${sanitize(name)} = porf_pack(${value})` : `${gname(name)} = ${value}`;
   // per-thread stand-ins for builtin static array literals: data segment id -> capacity
   const scratchArrs = new Map();
   const promiseResolveFunc = funcByName.get('__Porffor_promise_resolve');
@@ -515,7 +519,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
 
       case K.Global:
         cur.globals[node[N_A]] = true;
-        return [gname(node[N_A]), P_POSTFIX];
+        return [packedGlobal(node[N_A]) ? `porf_unpack(${sanitize(node[N_A])})` : gname(node[N_A]), P_POSTFIX];
       case K.Local:
         return [sanitize(node[N_A]), P_PRIM];
 
@@ -708,7 +712,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
       case K.Assign:
         if (coro && isSuspend(node[N_B])) return renderSuspend(node[N_A], node[N_B]);
         if (node[N_A][N_KIND] === K.Global) cur.globals[node[N_A][N_A]] = true;
-        emit(`${ind()}${node[N_A][N_KIND] === K.Global ? gname(node[N_A][N_A]) : sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)};\n`);
+        emit(`${ind()}${node[N_A][N_KIND] === K.Global ? globalAssign(node[N_A][N_A], rx(node[N_B], P_COMMA)) : `${sanitize(node[N_A][N_A])} = ${rx(node[N_B], P_COMMA)}`};\n`);
         return;
 
       case K.Store: {
@@ -749,7 +753,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
         const [stmts, label] = node[N_C];
         const updateC = update == null ? null
           : update[N_KIND] === K.Assign
-            ? `${update[N_A][N_KIND] === K.Global ? gname(update[N_A][N_A]) : sanitize(update[N_A][N_A])} = ${rx(update[N_B], P_COMMA)}`
+            ? (update[N_A][N_KIND] === K.Global ? globalAssign(update[N_A][N_A], rx(update[N_B], P_COMMA)) : `${sanitize(update[N_A][N_A])} = ${rx(update[N_B], P_COMMA)}`)
             : rx(update, P_COMMA);
         // resume through the header, a second loop entry would make the cfg irreducible
         const region = coro && hasSuspend(stmts) ? { id: coro.regions.length, cases: [] } : null;
@@ -1547,6 +1551,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
   // module globals (top-level JS bindings)
   for (const g of globals) {
     if (threadGlobalSet.has(g.name)) continue;
+    if (packedGlobal(g.name)) { link.push(`${st}jsbits ${sanitize(g.name)} = JV_UNDEFINED_BITS;\n`); continue; }
     link.push(`${st}${CT[g.type]} ${sanitize(g.name)}${g.type === T.jsval ? ` = {0.0, ${TYPES.undefined}}` : ''};\n`);
   }
   if (usesThreads) {
@@ -1565,7 +1570,9 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
       const perThread = threadGlobalSet.has(g.name);
       const rootLines = perThread ? markThreadRootLines : markGlobalRootLines;
       const rawLines = perThread ? markThreadRawLines : markGlobalRawLines;
-      if (g.type === T.jsval) rootLines.push(`  porf_gc_mark_js(${name}.val, ${name}.type);`);
+      if (g.type === T.jsval) rootLines.push(packedGlobal(g.name)
+        ? `  { const jsval v = porf_unpack(${sanitize(g.name)}); porf_gc_mark_js(v.val, v.type); }`
+        : `  porf_gc_mark_js(${name}.val, ${name}.type);`);
       else if (g.type === T.ptr || (g.type === T.i32 && /(?:underlyingStore|underlyingBuckets|__Porffor_regex_cache|__Porffor_dataview_reinterpretTemp)$/.test(g.name))) {
         if (/underlyingStore$/.test(g.name)) {
           const buckets = sanitize(g.name.replace(/underlyingStore$/, 'underlyingBuckets'));
@@ -3013,7 +3020,7 @@ static int porf_gc_object_shape_valid(i32 body) {
   if (size > capacity) return 0;
   const i32 entries = *(u32*)(MEM + body + 12);
   if (entries == 0) return size == 0;
-  const u64 entry_bytes = (u64)capacity * 20ull;
+  const u64 entry_bytes = (u64)capacity * 24ull;
   if (entries == body + 16) return 16ull + entry_bytes <= (u64)block_size;
   if (porf_gc_in_static(entries)) return porf_gc_static_range(entries, entry_bytes);
   if (!porf_gc_is_block_start(entries)) return 0;
@@ -3027,7 +3034,7 @@ static int porf_gc_static_object_shape_valid(i32 body) {
   if (size > capacity) return 0;
   const i32 entries = *(u32*)(MEM + body + 12);
   if (entries == 0) return size == 0;
-  const u64 entry_bytes = (u64)capacity * 20ull;
+  const u64 entry_bytes = (u64)capacity * 24ull;
   if (entries == body + 16) return porf_gc_static_range(body, 16ull + entry_bytes);
   if (porf_gc_in_static(entries)) return porf_gc_static_range(entries, entry_bytes);
   if (!porf_gc_is_block_start(entries)) return 0;
@@ -3382,9 +3389,8 @@ static void porf_gc_scan_body(i32 body, i32 type) {
       if (parent != 0) porf_gc_mark_js((f64)parent, ${TYPES.__porffor_closureenv});
       const u32 count = *(u32*)(MEM + body + 4);
       for (u32 i = 0; i < count; i++) {
-        const u32 slot = body + 8u + i * 16u;
-        const u8 tag = *(u8*)(MEM + slot + 8);
-        if (porf_gc_type_can_reference(tag)) porf_gc_mark_js(*(f64*)(MEM + slot), tag);
+        const jsval v = porf_unpack(*(jsbits*)(MEM + body + 8u + i * 8u));
+        if (porf_gc_type_can_reference(v.type)) porf_gc_mark_js(v.val, v.type);
       }
       break;
     }
@@ -3399,7 +3405,7 @@ static void porf_gc_scan_body(i32 body, i32 type) {
         if (entries != body + 16) {
           porf_gc_set_kind(entries, PORF_GC_KIND_OBJECT_ENTRIES);
           if (porf_gc_is_block_start(entries)) {
-            const u32 max_size = porf_gc_block_size(entries) / 20u;
+            const u32 max_size = porf_gc_block_size(entries) / 24u;
             if (size > max_size) size = max_size;
           }
         }
@@ -3611,7 +3617,7 @@ static void porf_gc_drain_mark_queue(void) {
 
 static void porf_gc_scan_object_entries_range(i32 entries, u32 from, u32 to) {
   for (u32 i = from; i < to; i++) {
-    const i32 entry = entries + (i32)(i * 20u);
+    const i32 entry = entries + (i32)(i * 24u);
     const i32 key_type = *(u8*)(MEM + entry + 18);
     const u32 key = *(u32*)(MEM + entry + 4);
     if (key >= porf_heap_base && porf_gc_type_can_reference(key_type)) porf_gc_mark_js((f64)key, key_type);
@@ -3622,15 +3628,15 @@ static void porf_gc_scan_object_entries_range(i32 entries, u32 from, u32 to) {
       if (get != 0) porf_gc_mark_js((f64)get, ${TYPES.function});
       if (set != 0) porf_gc_mark_js((f64)set, ${TYPES.function});
     } else {
-      const i32 value_type = *(u8*)(MEM + entry + 17);
-      if (porf_gc_type_can_reference(value_type)) porf_gc_mark_js(porf_load_un_f64(MEM + entry + 8), value_type);
+      const jsval value = porf_unpack(*(jsbits*)(MEM + entry + 8));
+      if (porf_gc_type_can_reference(value.type)) porf_gc_mark_js(value.val, value.type);
     }
   }
 }
 
 static void porf_gc_scan_object_entries(i32 entries) {
   if (!porf_gc_is_block_start(entries)) return;
-  porf_gc_scan_object_entries_range(entries, 0, porf_gc_block_size(entries) / 20u);
+  porf_gc_scan_object_entries_range(entries, 0, porf_gc_block_size(entries) / 24u);
 }
 
 static void porf_gc_scan_underlying_store(i32 body) {
@@ -3946,9 +3952,9 @@ static void porf_gc_scan_card_object(u32 base, u32 from, u32 to) {
     return;
   }
   if (kind == PORF_GC_KIND_OBJECT_ENTRIES) {
-    const u32 capacity = porf_gc_block_size((i32)base) / 20u;
-    u32 i0 = from > base ? (from - base) / 20u : 0u;
-    u32 i1 = to > base ? (to - base + 19u) / 20u : 0u;
+    const u32 capacity = porf_gc_block_size((i32)base) / 24u;
+    u32 i0 = from > base ? (from - base) / 24u : 0u;
+    u32 i1 = to > base ? (to - base + 23u) / 24u : 0u;
     if (i1 > capacity) i1 = capacity;
     if (i1 > i0) porf_gc_scan_object_entries_range((i32)base, i0, i1);
     return;
@@ -4734,15 +4740,25 @@ static inline jsval porf_box_num(f64 d) { return (jsval){d, ${TYPES.number}}; }
 static inline jsval porf_box(f64 payload, i32 type) {
   return type == ${TYPES.number} ? porf_box_num(payload) : (jsval){payload, type};
 }
+// bigints are rare: keeping their conversions out of line stops the compiler from
+// if-converting them into every pack/unpack (a long fp dependency chain on each access)
+__attribute__((noinline, cold)) static jsbits porf_pack_bigint(f64 val) {
+  return JV_PATTERN | ((u64)${TYPES.bigint} << 43) | (val >= 2251799813685248.0
+    ? JV_BIGINT_HEAP | (u64)(u32)(val - 2251799813685248.0)
+    : (u64)(i64)val & (JV_BIGINT_HEAP - 1));
+}
+__attribute__((noinline, cold)) static jsval porf_unpack_bigint(jsbits b) {
+  return (jsval){b & JV_BIGINT_HEAP
+    ? 2251799813685248.0 + (f64)(u32)b
+    : (f64)((i64)(b << 22) >> 22), ${TYPES.bigint}};
+}
 static inline jsbits porf_pack(jsval v) {
   if (v.type == ${TYPES.number}) {
     const jsbits b = porf_f64_to_bits(v.val);
     // negative quiet NaNs collide with the boxed encoding: canonicalize
     return (b & JV_PATTERN) == JV_PATTERN ? 0x7FF8000000000000ull : b;
   }
-  if (v.type == ${TYPES.bigint}) return JV_PATTERN | ((u64)${TYPES.bigint} << 43) | (v.val >= 2251799813685248.0
-    ? JV_BIGINT_HEAP | (u64)(u32)(v.val - 2251799813685248.0)
-    : (u64)(i64)v.val & (JV_BIGINT_HEAP - 1));
+  if (__builtin_expect(v.type == ${TYPES.bigint}, 0)) return porf_pack_bigint(v.val);
   return JV_PATTERN | ((u64)(v.type & 0xFF) << 43) | (u64)(u32)v.val;
 }
 ${sti}jsbits porf_arr_pack(jsval v) {
@@ -4752,9 +4768,7 @@ ${sti}jsbits porf_arr_pack(jsval v) {
 static inline jsval porf_unpack(jsbits b) {
   if ((b & JV_PATTERN) != JV_PATTERN) return porf_box_num(porf_bits_to_f64(b));
   const i32 type = (i32)((b >> 43) & 0xFF);
-  if (type == ${TYPES.bigint}) return (jsval){b & JV_BIGINT_HEAP
-    ? 2251799813685248.0 + (f64)(u32)b
-    : (f64)((i64)(b << 22) >> 22), type};
+  if (__builtin_expect(type == ${TYPES.bigint}, 0)) return porf_unpack_bigint(b);
   return (jsval){(f64)(u32)b, type};
 }
 static inline f64 porf_canon(f64 d) { return d == d ? d : porf_bits_to_f64(0x7FF8000000000000ull); }

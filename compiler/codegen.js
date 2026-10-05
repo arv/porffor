@@ -382,21 +382,18 @@ const currentClosureEnv = scope => {
   return valUndefined();
 };
 
-// [parent u32][count u32][payload f64, type u8, padding x7]...
+// [parent u32][count u32][value jsbits]...: one aligned word per slot, so racing threads
+// can never see a new payload with an old type
 const makeClosureEnv = (scope, parent, count, values = null) => {
-  const pointer = reuse(scope, Alloc(Const(T.i32, 8 + count * 16), TYPES.__porffor_closureenv));
+  const pointer = reuse(scope, Alloc(Const(T.i32, 8 + count * 8), TYPES.__porffor_closureenv));
   stmt(scope, Store('u32', pointer, 0, JvPtr(parent)));
   if (values) {
-    for (let i = 0; i < values.length; i++) {
-      stmt(scope, Store('f64', pointer, 8 + i * 16, JvNum(values[i])));
-      stmt(scope, Store('u8', pointer, 16 + i * 16, JvType(values[i])));
-    }
+    for (let i = 0; i < values.length; i++) stmt(scope, Store('jsval', pointer, 8 + i * 8, values[i]));
   } else {
     const index = tmp(scope, T.i32, Const(T.i32, 0));
-    const slot = Bin('+', T.u32, pointer, Bin('*', T.i32, index, Const(T.i32, 16)));
+    const slot = Bin('+', T.u32, pointer, Bin('*', T.i32, index, Const(T.i32, 8)));
     stmt(scope, Loop(Bin('<', T.i32, index, Const(T.i32, count)), null, [
-      Store('f64', slot, 8, Const(T.f64, 0)),
-      Store('u8', slot, 16, Const(T.i32, TYPES.undefined)),
+      Store('jsval', slot, 8, valUndefined()),
       Assign(index, Bin('+', T.i32, index, Const(T.i32, 1)))
     ], fresh(scope)));
   }
@@ -2961,8 +2958,7 @@ const generateAssign = (scope, decl, valueUnused = false) => {
     const previous = op === '=' ? null : reuse(scope, generateMember(scope, decl.left, env));
     const right = generate(scope, decl.right);
     const value = reuse(scope, op === '=' ? right : performOp(scope, op, previous, right, null, getNodeType(scope, decl.right)));
-    stmt(scope, Store('f64', JvPtr(env), 8 + slot * 16, JvNum(value)));
-    stmt(scope, Store('u8', JvPtr(env), 16 + slot * 16, JvType(value)));
+    stmt(scope, Store('jsval', JvPtr(env), 8 + slot * 8, value));
     stmt(scope, If(canReferenceCheck(scope, value), [
       GcBarrier(JvPtr(env), Const(T.i32, TYPES.__porffor_closureenv))
     ]));
@@ -3686,7 +3682,7 @@ const generateForIn = (scope, decl) => {
             () => genStmt(scope, decl.body));
         }), C));
         assign(scope, counter, Bin('+', T.i32, counter, Const(T.i32, 1)));
-        assign(scope, pointer, Bin('+', T.u32, pointer, Const(T.u32, 20)));
+        assign(scope, pointer, Bin('+', T.u32, pointer, Const(T.u32, 24)));
       });
 
       inferLoopEnd(scope);
@@ -4115,12 +4111,11 @@ const generateObject = (scope, decl) => {
       const prop = reuse(scope, generate(scope, key));
       const val = reuse(scope, coerceValue(generate(scope, value), T.jsval));
       const entries = Load('u32', JvPtr(obj), 12);
-      stmt(scope, Store('i32', entries, slot * 20, Const(T.i32, hash)));
-      stmt(scope, Store('u32', entries, slot * 20 + 4, JvPtr(prop)));
-      stmt(scope, Store('f64', entries, slot * 20 + 8, JvNum(val), true));
-      stmt(scope, Store('u8', entries, slot * 20 + 16, Const(T.i32, 14)));
-      stmt(scope, Store('u8', entries, slot * 20 + 17, JvType(val)));
-      stmt(scope, Store('u8', entries, slot * 20 + 18, JvType(prop)));
+      stmt(scope, Store('i32', entries, slot * 24, Const(T.i32, hash)));
+      stmt(scope, Store('u32', entries, slot * 24 + 4, JvPtr(prop)));
+      stmt(scope, Store('jsval', entries, slot * 24 + 8, val));
+      stmt(scope, Store('u8', entries, slot * 24 + 16, Const(T.i32, 14)));
+      stmt(scope, Store('u8', entries, slot * 24 + 18, JvType(prop)));
       stmt(scope, Store('u16', JvPtr(obj), 0, Const(T.i32, ++slot)));
       stmt(scope, If(canReferenceCheck(scope, val), [ GcBarrier(JvPtr(obj), Const(T.i32, TYPES.object)) ]));
     } else {
@@ -4190,7 +4185,7 @@ const generateMember = (scope, decl, objValue = null) => {
   if (closureSlot != null) {
     const pointer = JvPtr(reuse(scope, objValue ?? generate(scope, decl.object)));
     if (closureSlot === 0) return valOf(Load('u32', pointer, 0), TYPES.__porffor_closureenv);
-    return Box(Load('f64', pointer, 8 + (closureSlot - 1) * 16), Load('u8', pointer, 16 + (closureSlot - 1) * 16));
+    return Load('jsval', pointer, 8 + (closureSlot - 1) * 8);
   }
 
   const object = decl.object;
