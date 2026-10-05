@@ -84,8 +84,10 @@ export const __Porffor_regex_ucdCanon = (): bytestring => '\xb8\x01a4?T\x02\xce\
 
 // scratch buffers are bytestring jsvals so gc keeps them alive
 let __Porffor_regex_cache: i32 = 0;
-let __Porffor_regex_mruPattern: i32 = 0;
-let __Porffor_regex_mruFlags: i32 = 0;
+// the last pattern and flags strings themselves, so gc keeps them alive: compared by pointer,
+// a collected one's address could be reused by a new string with another pattern
+let __Porffor_regex_mruPattern: any = 0;
+let __Porffor_regex_mruFlags: any = 0;
 let __Porffor_regex_mruBlob: i32 = 0;
 let __Porffor_regex_mruNames: any = 0;
 let __Porffor_regex_mruCaps: i32 = 0;
@@ -3193,7 +3195,7 @@ export const __Porffor_regex_compile = (patternStr: bytestring|string, flagsStr:
   let caps: i32 = 0;
 
   // same interned pattern+flags pointers as last call, skip the cache walk
-  if (Porffor.IR.ptr(patternStr) == __Porffor_regex_mruPattern && Porffor.IR.ptr(flagsStr) == __Porffor_regex_mruFlags && __Porffor_regex_mruBlob != 0) {
+  if (Porffor.IR.ptr(patternStr) == Porffor.IR.ptr(__Porffor_regex_mruPattern) && Porffor.IR.ptr(flagsStr) == Porffor.IR.ptr(__Porffor_regex_mruFlags) && __Porffor_regex_mruBlob != 0) {
     blob = __Porffor_regex_mruBlob;
     names = __Porffor_regex_mruNames;
     caps = __Porffor_regex_mruCaps;
@@ -3229,8 +3231,8 @@ export const __Porffor_regex_compile = (patternStr: bytestring|string, flagsStr:
   }
 
   if (canCache) {
-    __Porffor_regex_mruPattern = Porffor.IR.ptr(patternStr);
-    __Porffor_regex_mruFlags = Porffor.IR.ptr(flagsStr);
+    __Porffor_regex_mruPattern = patternStr;
+    __Porffor_regex_mruFlags = flagsStr;
     __Porffor_regex_mruBlob = blob;
     __Porffor_regex_mruNames = names;
     __Porffor_regex_mruCaps = caps;
