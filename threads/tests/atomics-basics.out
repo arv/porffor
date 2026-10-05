@@ -1,0 +1,13 @@
+0 5 7 7 -3
+3 3 11 10 5
+0 42 7 7
+0 44 0 255 40000 -25536 0 4294967295
+1099511627781 5 0 true 0
+0n 5n -5n true 0n true 3n
+not-equal timed-out 0 not-equal
+TypeError
+RangeError
+RangeError
+TypeError
+TypeError
+true false

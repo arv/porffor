@@ -1,0 +1,7 @@
+hold true
+queue true true true
+TypeError
+TypeError
+TypeError
+released after throw ok
+timed false true [object Lock] [object Condition]
