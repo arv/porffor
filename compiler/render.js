@@ -1796,19 +1796,33 @@ static porf_coro_call* porf_coro_unbox(jsval gen) {
 // TS-facing coroutine mechanism (generator.ts + for-of build the iterator protocol and
 // the { value, done } result on top of these). mode: 0 = next, 1 = throw the value at the
 // suspend point, 2 = return (force completion with the value). returns 1 once done.
+// with threads another thread may resume the same generator at once: whoever claims it
+// first runs it, the rest find it running (a TypeError) instead of sharing its frame
+${usesThreads ? `#define PORF_CORO_CLAIM(c) __atomic_exchange_n(&(c)->busy, 1, __ATOMIC_ACQUIRE)
+#define PORF_CORO_FREE(c) __atomic_store_n(&(c)->busy, 0, __ATOMIC_RELEASE)
+// what it produced, taken while still claimed: the caller reads it next, from this thread
+#define PORF_CORO_SNAP(c, gen) do { porf_ts->coro_value = (c)->state == 3 ? (c)->result : (c)->channel; porf_ts->coro_raw = (c)->raw; porf_ts->coro_gen = (u32)(gen).val; } while (0)` : `#define PORF_CORO_CLAIM(c) 0
+#define PORF_CORO_FREE(c) ((void)0)
+#define PORF_CORO_SNAP(c, gen) ((void)0)`}
 ${st}i32 __Porffor_coroutine_resume(jsval gen, jsval value, i32 mode) {
   porf_coro_call* call = porf_coro_unbox(gen);
+  if (PORF_CORO_CLAIM(call)) porf_throw_new(${TYPES.typeerror}, 0);
   if (mode == 2 && call->state == 2) {
     call->result = value;
     porf_coro_touch(call);
     value = PORF_CORO_RETURN;
     mode = 1;
   }
-  if (call->state == 1) porf_throw_new(${TYPES.typeerror}, 0);
+  if (call->state == 1) {
+    PORF_CORO_FREE(call);
+    porf_throw_new(${TYPES.typeerror}, 0);
+  }
   if (mode != 0 ? call->state != 2 : call->state == 3) {
     porf_coro_finish(call);
     call->result = mode == 2 ? value : JV_UNDEFINED;
     porf_coro_touch(call);
+    PORF_CORO_SNAP(call, gen);
+    PORF_CORO_FREE(call);
     if (mode == 1) porf_throw(value);
     return 1;
   }
@@ -1818,11 +1832,14 @@ ${st}i32 __Porffor_coroutine_resume(jsval gen, jsval value, i32 mode) {
   if (_setjmp(porf_try_ensure()[try_idx]) == 0) {
     const i32 done = porf_coro_call_step(call, value, mode == 1);
     porf_try_depth = try_idx;
+    PORF_CORO_SNAP(call, gen);
+    PORF_CORO_FREE(call);
     return done;
   }
 
   porf_try_depth = try_idx;
   porf_coro_abort(call);
+  PORF_CORO_FREE(call);
   if (porf_jv_eq(porf_exception, PORF_CORO_RETURN)) return 1;
   porf_throw(porf_exception);
 }
@@ -1831,10 +1848,12 @@ ${st}i32 __Porffor_coroutine_resume(jsval gen, jsval value, i32 mode) {
 // most recently yielded value
 ${st}jsval __Porffor_coroutine_value(jsval gen) {
   porf_coro_call* call = porf_coro_unbox(gen);
+${usesThreads ? '  if (porf_ts->coro_gen == (u32)gen.val) return porf_ts->coro_value;\n' : ''}\
   return call->state == 3 ? call->result : call->channel;
 }
 
 ${st}i32 __Porffor_coroutine_raw(jsval gen) {
+${usesThreads ? '  if (porf_ts->coro_gen == (u32)gen.val) return porf_ts->coro_raw;\n' : ''}\
   return porf_coro_unbox(gen)->raw;
 }
 
@@ -2512,7 +2531,7 @@ static u32 porf_gc_free_page_count = 0;
 struct porf_gc_window { u32 cur, end, lo; };
 ${threads ? `// each thread allocates from its own windows (porf_gc_active is per thread)
 static struct porf_gc_window porf_main_gc_active[PORF_GC_NCLASSES];
-static porf_tstate porf_main_ts = { .gc_active = porf_main_gc_active, .lock_id = 1u << 12, .exception = {0.0, ${TYPES.undefined}}, .iter_open = {0.0, ${TYPES.undefined}} };
+static porf_tstate porf_main_ts = { .gc_active = porf_main_gc_active, .lock_id = 1u << 12, .coro_value = {0.0, ${TYPES.undefined}}, .exception = {0.0, ${TYPES.undefined}}, .iter_open = {0.0, ${TYPES.undefined}} };
 ` : 'static struct porf_gc_window porf_gc_active[PORF_GC_NCLASSES];\n'}\
 static u32 porf_gc_partial[PORF_GC_NCLASSES];
 
@@ -4268,6 +4287,7 @@ ${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
     porf_gc_mark_cons_roots();
     porf_gc_mark_js(porf_exception.val, porf_exception.type);
     porf_gc_mark_js(porf_iter_open.val, porf_iter_open.type);
+    porf_gc_mark_js(t->coro_value.val, t->coro_value.type);
     if (t->thread_obj != 0) porf_gc_mark_js((f64)t->thread_obj, ${TYPES.thread});
     porf_gc_mark_thread_global_roots();
   }
@@ -4370,6 +4390,9 @@ typedef struct porf_tstate {
   struct porf_tglobals* tg;
   u32 thread_obj;
   u32 lock_id; // owner tag in array locks: a unique id << 12
+  jsval coro_value; // what the last generator this thread resumed produced (coro_gen)
+  u32 coro_gen;
+  i32 coro_raw;
   void* stack_lo;
   jmp_buf regs;
   struct porf_tstate* next;
@@ -4555,6 +4578,7 @@ static i32 porf_thread_spawn(u32 obj) {
   t->tg = tg;
   t->exception = JV_UNDEFINED;
   t->iter_open = JV_UNDEFINED;
+  t->coro_value = JV_UNDEFINED;
   t->thread_obj = obj;
   static u32 porf_lock_ids = 1;
   t->lock_id = (__atomic_add_fetch(&porf_lock_ids, 1u, __ATOMIC_RELAXED) & 0xfffffu) << 12;
@@ -5221,6 +5245,165 @@ ${st}jsval porf_arr_push(PORF_ROOT u32 a, PORF_ROOT jsval v) {
   return porf_box_num((f64)(len + 1));
 }
 
+// ---- atomics ----
+// on typed array elements, by arena offset. buffer data starts 4 bytes into a block, so
+// 8 to 32 bit elements are naturally aligned and use the hardware's atomics, but 64 bit
+// ones are only 4-aligned: those take a striped lock, which is enough as Atomics need
+// only be atomic against each other. ops: 0 load, 1 store, 2 add, 3 sub, 4 and, 5 or,
+// 6 xor, 7 exchange, 8 compareExchange
+#define PORF_AT_RMW(T) static T porf_at_rmw_##T(T* p, i32 op, T v, T e) { \
+  switch (op) { \
+    case 0: return __atomic_load_n(p, __ATOMIC_SEQ_CST); \
+    case 1: __atomic_store_n(p, v, __ATOMIC_SEQ_CST); return v; \
+    case 2: return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); \
+    case 3: return __atomic_fetch_sub(p, v, __ATOMIC_SEQ_CST); \
+    case 4: return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); \
+    case 5: return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); \
+    case 6: return __atomic_fetch_xor(p, v, __ATOMIC_SEQ_CST); \
+    case 7: return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); \
+    default: __atomic_compare_exchange_n(p, &e, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; \
+  } \
+}
+PORF_AT_RMW(u8)
+PORF_AT_RMW(u16)
+PORF_AT_RMW(u32)
+
+// an integral number (ToIntegerOrInfinity) modulo 2^32, as typed array stores wrap
+static u32 porf_at_wrap(f64 v) {
+  if (!(v == v) || v == INFINITY || v == -INFINITY) return 0;
+  f64 m = fmod(v, 4294967296.0);
+  if (m < 0) m += 4294967296.0;
+  return (u32)m;
+}
+
+// kind: 0 int8 1 uint8 2 int16 3 uint16 4 int32 5 uint32. the old value (store: the new one)
+static f64 porf_atomic_op(u32 addr, i32 kind, i32 op, f64 v, f64 e) {
+  const u32 wv = porf_at_wrap(v), we = porf_at_wrap(e);
+  switch (kind) {
+    case 0: return (f64)(int8_t)porf_at_rmw_u8((u8*)(MEM + addr), op, (u8)wv, (u8)we);
+    case 1: return (f64)porf_at_rmw_u8((u8*)(MEM + addr), op, (u8)wv, (u8)we);
+    case 2: return (f64)(int16_t)porf_at_rmw_u16((u16*)(MEM + addr), op, (u16)wv, (u16)we);
+    case 3: return (f64)porf_at_rmw_u16((u16*)(MEM + addr), op, (u16)wv, (u16)we);
+    case 4: return (f64)(i32)porf_at_rmw_u32((u32*)(MEM + addr), op, wv, we);
+    default: return (f64)porf_at_rmw_u32((u32*)(MEM + addr), op, wv, we);
+  }
+}
+
+#define PORF_AT_STRIPES 64u
+static u32 porf_at_stripes[PORF_AT_STRIPES];
+static u64 porf_atomic_op64(u32 addr, i32 op, u64 v, u64 e) {
+  u32* l = &porf_at_stripes[(addr >> 3) & (PORF_AT_STRIPES - 1u)];
+  while (__atomic_exchange_n(l, 1u, __ATOMIC_ACQUIRE)) while (__atomic_load_n(l, __ATOMIC_RELAXED)) {}
+  u64 old;
+  memcpy(&old, MEM + addr, 8);
+  u64 nv = old;
+  switch (op) {
+    case 1: case 7: nv = v; break;
+    case 2: nv = old + v; break;
+    case 3: nv = old - v; break;
+    case 4: nv = old & v; break;
+    case 5: nv = old | v; break;
+    case 6: nv = old ^ v; break;
+    case 8: if (old == e) nv = v; break;
+  }
+  if (nv != old) memcpy(MEM + addr, &nv, 8);
+  __atomic_store_n(l, 0u, __ATOMIC_RELEASE);
+  return old;
+}
+
+// Atomics.wait: 0 "ok", 1 "not-equal", 2 "timed-out". size 4 (int32) or 8 (bigint64)
+${threads ? `// waiters queue in order behind one lock; a waiter counts as parked for collections
+struct porf_waiter { u32 addr; i32 woken; pthread_cond_t cond; struct porf_waiter* next; };
+static pthread_mutex_t porf_wait_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct porf_waiter* porf_waiters = NULL;
+
+static i32 porf_atomic_wait(u32 addr, i32 size, u64 expected, f64 timeout_ms) {
+  struct porf_waiter w;
+  w.addr = addr; w.woken = 0; w.next = NULL;
+  pthread_cond_init(&w.cond, NULL);
+  struct timespec deadline = { 0, 0 };
+  const int timed = timeout_ms != INFINITY;
+  if (timed) {
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    const f64 ns = (f64)deadline.tv_nsec + fmod(timeout_ms, 1000.0) * 1e6;
+    deadline.tv_sec += (time_t)(timeout_ms / 1000.0) + (time_t)(ns / 1e9);
+    deadline.tv_nsec = (long)fmod(ns, 1e9);
+  }
+  porf_blocking_enter();
+  pthread_mutex_lock(&porf_wait_lock);
+  // the value check and the enqueue are one step against notify, so no wakeup is lost
+  const u64 cur = size == 4 ? (u64)__atomic_load_n((u32*)(MEM + addr), __ATOMIC_SEQ_CST) : porf_atomic_op64(addr, 0, 0, 0);
+  i32 res = 1;
+  if (cur == (size == 4 ? (u64)(u32)expected : expected)) {
+    struct porf_waiter** tail = &porf_waiters;
+    while (*tail) tail = &(*tail)->next;
+    *tail = &w;
+    while (!w.woken) {
+      if (!timed) pthread_cond_wait(&w.cond, &porf_wait_lock);
+        else if (pthread_cond_timedwait(&w.cond, &porf_wait_lock, &deadline) != 0) break;
+    }
+    if (w.woken) res = 0;
+    else {
+      res = 2;
+      for (struct porf_waiter** p = &porf_waiters; *p; p = &(*p)->next) if (*p == &w) { *p = w.next; break; }
+    }
+  }
+  pthread_mutex_unlock(&porf_wait_lock);
+  porf_blocking_exit();
+  pthread_cond_destroy(&w.cond);
+  return res;
+}
+
+// wakes up to count waiters on addr, oldest first
+static f64 porf_atomic_notify(u32 addr, f64 count) {
+  f64 n = 0;
+  pthread_mutex_lock(&porf_wait_lock);
+  for (struct porf_waiter** p = &porf_waiters; *p && n < count;) {
+    struct porf_waiter* w = *p;
+    if (w->addr != addr) { p = &w->next; continue; }
+    *p = w->next;
+    w->woken = 1;
+    pthread_cond_signal(&w->cond);
+    n++;
+  }
+  pthread_mutex_unlock(&porf_wait_lock);
+  return n;
+}
+` : `// one thread: nothing can notify, so a matching wait just sleeps out its timeout
+static i32 porf_atomic_wait(u32 addr, i32 size, u64 expected, f64 timeout_ms) {
+  const u64 cur = size == 4 ? (u64)*(u32*)(MEM + addr) : porf_atomic_op64(addr, 0, 0, 0);
+  if (cur != (size == 4 ? (u64)(u32)expected : expected)) return 1;
+  do {
+    const f64 ms = timeout_ms > 1e9 ? 1e9 : timeout_ms;
+    struct timespec ts = { (time_t)(ms / 1000.0), (long)(fmod(ms, 1000.0) * 1e6) };
+    nanosleep(&ts, NULL);
+    timeout_ms -= ms;
+  } while (timeout_ms > 0);
+  return 2;
+}
+static f64 porf_atomic_notify(u32 addr, f64 count) { (void)addr; (void)count; return 0; }
+`}
+
+// Lock: a futex mutex word (0 free, 1 held, 2 held with waiters) at addr
+${threads ? '#define porf_self_id() (porf_ts->lock_id)' : '#define porf_self_id() 1u'}
+static void porf_mutex_lock(u32 addr) {
+  u32* p = (u32*)(MEM + addr);
+  u32 c = 0;
+  if (__atomic_compare_exchange_n(p, &c, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+  if (c != 2u) c = __atomic_exchange_n(p, 2u, __ATOMIC_ACQUIRE);
+  while (c != 0u) {
+    porf_atomic_wait(addr, 4, 2u, INFINITY);
+    c = __atomic_exchange_n(p, 2u, __ATOMIC_ACQUIRE);
+  }
+}
+static void porf_mutex_unlock(u32 addr) {
+  u32* p = (u32*)(MEM + addr);
+  if (__atomic_fetch_sub(p, 1u, __ATOMIC_RELEASE) != 1u) {
+    __atomic_store_n(p, 0u, __ATOMIC_RELEASE);
+    porf_atomic_notify(addr, 1);
+  }
+}
+
 // ---- strings ----
 ${st}u32 porf_bstr_new(u32 len) {
   const u32 s = porf_alloc(4 + len, ${TYPES.bytestring});
@@ -5509,6 +5692,7 @@ typedef struct porf_coro_call {
   i32 raw;                // channel is an iterator result to pass through as-is
   i32 awaiting;           // suspended at an await (channel is its promise), not a yield
   i32 caller_iter_base;
+  i32 busy;               // claimed by a thread resuming it (with threads)
 } porf_coro_call;
 #define PORF_CORO_HDR ((u32)((sizeof(porf_coro_call) + 7u) & ~7u))
 #define PORF_CORO_BYTES(frame, argc) (PORF_CORO_HDR + (frame) + (u32)(argc) * 8u)
@@ -5614,6 +5798,7 @@ static void porf_coro_init(porf_coro_call* c, u32 heap, u32 frame, u32 idx, jsva
   c->frame_size = frame;
   c->argc = argc;
   c->state = 0;
+  c->busy = 0;
   c->resume = 0;
   c->throw_pending = 0;
   c->raw = 0;

@@ -57,3 +57,116 @@ export const __Thread_prototype_join = function (this: Thread) {
 
 export const __Thread_prototype_toString = function (this: Thread) { return '[object Thread]'; };
 export const __Thread_prototype_toLocaleString = function (this: Thread) { return Porffor.callThis(__Thread_prototype_toString, this); };
+
+// Lock and Condition (also from the strawman): a futex mutex and condition variable on
+// the same waiting as Atomics.wait/notify, so a blocked thread never holds up collections
+
+// __memory layout__
+// per lock (8):
+//  state (u32, 4) - 0 free, 1 held, 2 held with waiters
+//  holder (u32, 4) - the holding thread's id, 0 when free
+// per condition (8):
+//  sequence (u32, 4) - bumped by every notify, waiters sleep while it is unchanged
+//  padding (u32, 4)
+
+export const Lock = function (): Lock {
+  if (!new.target) throw new TypeError("Constructor Lock requires 'new'");
+
+  const lock: Lock = Porffor.malloc(8);
+  Porffor.IR.storeI32(lock, 0, 0);
+  Porffor.IR.storeI32(lock, 4, 0);
+  return lock;
+};
+
+export const __Porffor_lock_acquire = (lock: Lock): void => {
+  const lockAddr: i32 = Porffor.IR.ptr(lock);
+  let selfId: i32 = 0;
+  Porffor.c`selfId = (i32)porf_self_id();`;
+  // not reentrant: taking it again would wait forever
+  if (Porffor.IR.loadI32(lock, 4) == selfId) throw new TypeError('Lock is already held by this thread');
+
+  Porffor.c`porf_mutex_lock((u32)lockAddr);`;
+  Porffor.IR.storeI32(lock, 4, selfId);
+};
+
+export const __Porffor_lock_release = (lock: Lock): void => {
+  const lockAddr: i32 = Porffor.IR.ptr(lock);
+  Porffor.IR.storeI32(lock, 4, 0);
+  Porffor.c`porf_mutex_unlock((u32)lockAddr);`;
+};
+
+// runs fn holding the lock, releasing it however fn returns
+export const __Lock_prototype_hold = function (this: Lock, fn: any) {
+  if (Porffor.type(fn) != Porffor.TYPES.function) throw new TypeError('Lock.prototype.hold: argument must be a function');
+
+  __Porffor_lock_acquire(this);
+  let out: any;
+  try {
+    out = Porffor.callThis(fn, undefined);
+  } catch (e) {
+    __Porffor_lock_release(this);
+    throw e;
+  }
+
+  __Porffor_lock_release(this);
+  return out;
+};
+
+export const __Lock_prototype_toString = function (this: Lock) { return '[object Lock]'; };
+export const __Lock_prototype_toLocaleString = function (this: Lock) { return Porffor.callThis(__Lock_prototype_toString, this); };
+
+export const Condition = function (): Condition {
+  if (!new.target) throw new TypeError("Constructor Condition requires 'new'");
+
+  const cond: Condition = Porffor.malloc(8);
+  Porffor.IR.storeI32(cond, 0, 0);
+  Porffor.IR.storeI32(cond, 4, 0);
+  return cond;
+};
+
+// releases lock (which must be held), sleeps until notified or out of time (ms), then
+// takes lock again. false if it timed out. wakeups may be spurious: wait in a loop
+export const __Condition_prototype_wait = function (this: Condition, lock: any, timeout: any) {
+  if (Porffor.type(lock) != Porffor.TYPES.lock) throw new TypeError('Condition.prototype.wait: argument must be a Lock');
+  let selfId: i32 = 0;
+  Porffor.c`selfId = (i32)porf_self_id();`;
+  if (Porffor.IR.loadI32(lock, 4) != selfId) throw new TypeError('Condition.prototype.wait: the Lock must be held');
+
+  let timeoutMs: number = Infinity;
+  if (Porffor.type(timeout) != Porffor.TYPES.undefined) {
+    timeoutMs = ecma262.ToNumber(timeout);
+    if (timeoutMs != timeoutMs) timeoutMs = Infinity;
+      else if (timeoutMs < 0) timeoutMs = 0;
+  }
+
+  // read the sequence before releasing: a notify after that changes it, so no wakeup is lost
+  const condAddr: i32 = Porffor.IR.ptr(this);
+  let seq: i32 = 0;
+  Porffor.c`seq = (i32)__atomic_load_n((u32*)(MEM + (u32)condAddr), __ATOMIC_SEQ_CST);`;
+  __Porffor_lock_release(lock);
+
+  let waitResult: i32 = 0;
+  Porffor.c`waitResult = porf_atomic_wait((u32)condAddr, 4, (u64)(u32)seq, timeoutMs);`;
+  __Porffor_lock_acquire(lock);
+  return waitResult != 2;
+};
+
+// wake one waiter / all waiters, returning how many were woken
+export const __Condition_prototype_notifyOne = function (this: Condition) {
+  const condAddr: i32 = Porffor.IR.ptr(this);
+  let woken: number = 0;
+  Porffor.c`__atomic_fetch_add((u32*)(MEM + (u32)condAddr), 1u, __ATOMIC_SEQ_CST);
+woken = porf_atomic_notify((u32)condAddr, 1);`;
+  return woken;
+};
+
+export const __Condition_prototype_notifyAll = function (this: Condition) {
+  const condAddr: i32 = Porffor.IR.ptr(this);
+  let woken: number = 0;
+  Porffor.c`__atomic_fetch_add((u32*)(MEM + (u32)condAddr), 1u, __ATOMIC_SEQ_CST);
+woken = porf_atomic_notify((u32)condAddr, INFINITY);`;
+  return woken;
+};
+
+export const __Condition_prototype_toString = function (this: Condition) { return '[object Condition]'; };
+export const __Condition_prototype_toLocaleString = function (this: Condition) { return Porffor.callThis(__Condition_prototype_toString, this); };

@@ -72,3 +72,5 @@ for (const x of [ '', 'Aggregate', 'Type', 'Reference', 'Syntax', 'Range', 'Eval
 
 // registered last so existing type ids (baked into precompiled builtins) stay put
 registerInternalType('Thread');
+registerInternalType('Lock');
+registerInternalType('Condition');
