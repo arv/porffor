@@ -77,8 +77,7 @@ export const __Set_prototype_forEach = function (this: Set, callbackFn: any, thi
 export const Set = function (iterable: any): Set {
   if (!new.target) throw new TypeError("Constructor Set requires 'new'");
 
-  const out: Set = __Porffor_hashtableNew(false);
-  Porffor.IR.gcBarrier(out, Porffor.TYPES.set);
+  const out: Set = __Porffor_hashtableNew(Porffor.TYPES.set);
 
   if (iterable != null) for (const x of iterable) {
     Porffor.callThis(__Set_prototype_add, out, x);

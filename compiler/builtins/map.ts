@@ -91,8 +91,7 @@ export const __Map_prototype_forEach = function (this: Map, callbackFn: any, thi
 export const Map = function (iterable: any): Map {
   if (!new.target) throw new TypeError("Constructor Map requires 'new'");
 
-  const out: Map = __Porffor_hashtableNew(true);
-  Porffor.IR.gcBarrier(out, Porffor.TYPES.map);
+  const out: Map = __Porffor_hashtableNew(Porffor.TYPES.map);
 
   if (iterable != null) for (const x of iterable) {
     if (!Porffor.object.isObject(x)) throw new TypeError('Iterator contains non-object');

@@ -28,8 +28,7 @@ export const __WeakMap_prototype_delete = function (this: WeakMap, key: any) {
 export const WeakMap = function (iterable: any): WeakMap {
   if (!new.target) throw new TypeError("Constructor WeakMap requires 'new'");
 
-  const out: WeakMap = __Porffor_hashtableNew(true);
-  Porffor.IR.gcBarrier(out, Porffor.TYPES.weakmap);
+  const out: WeakMap = __Porffor_hashtableNew(Porffor.TYPES.weakmap);
 
   if (iterable != null) for (const x of iterable) {
     if (!Porffor.object.isObject(x)) throw new TypeError('Iterator contains non-object');

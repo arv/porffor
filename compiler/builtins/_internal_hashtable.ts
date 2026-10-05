@@ -196,16 +196,22 @@ export const __Porffor_hashtableTombstone = (container: any, key: any, index: an
   if (tombstones * 2 > keys.length) __Porffor_hashtableCompact(container);
 };
 
-export const __Porffor_hashtableNew = (withVals: boolean): any => {
+// type: map/set/weakmap/weakset, the gc kind the container is scanned as
+export const __Porffor_hashtableNew = (type: i32): any => {
+  // untyped malloc is a zeroed gc leaf: retag before allocating keys/vals so a collection
+  // there traces through it. barrier each store as that collection can promote it
   const out: any = Porffor.malloc(24);
+  Porffor.IR.gcBarrier(out, type);
   const outRaw: i32 = Porffor.IR.ptr(out);
   Porffor.c`*(u32*)(MEM + (u32)outRaw + 20u) = porf_self_tag();`;
 
   const keys: any[] = Porffor.array.new(4);
   Porffor.IR.storeI32(out, 0, keys);
-  if (withVals) {
+  Porffor.IR.gcBarrier(out, type);
+  if (Porffor.fastOr(type == Porffor.TYPES.map, type == Porffor.TYPES.weakmap)) {
     const vals: any[] = Porffor.array.new(4);
     Porffor.IR.storeI32(out, 4, vals);
+    Porffor.IR.gcBarrier(out, type);
   } else {
     Porffor.IR.storeI32(out, 4, 0);
   }

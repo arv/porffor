@@ -18,8 +18,7 @@ export const __WeakSet_prototype_delete = function (this: WeakSet, value: any) {
 export const WeakSet = function (iterable: any): WeakSet {
   if (!new.target) throw new TypeError("Constructor WeakSet requires 'new'");
 
-  const out: WeakSet = __Porffor_hashtableNew(false);
-  Porffor.IR.gcBarrier(out, Porffor.TYPES.weakset);
+  const out: WeakSet = __Porffor_hashtableNew(Porffor.TYPES.weakset);
   if (iterable != null) for (const x of iterable) {
     Porffor.callThis(__WeakSet_prototype_add, out, x);
   }
