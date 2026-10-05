@@ -352,27 +352,29 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
   const gname = name => threadGlobalSet.has(name) ? `porf_ts->tg->${sanitize(name)}` : sanitize(name);
   // jsval globals every thread shares live as one packed word, so racing writes never tear
   const globalTypeMap = new Map(globals.map(g => [ g.name, g.type ]));
-  // with threads a jsval global other threads may touch is one packed word, so none ever
-  // reads it torn. only the main thread runs top-level code (the entry function), so a
-  // global no other function uses stays a plain jsval, as without threads
+  // the globals some function other than the entry one (top-level code) uses
   const globalsOutsideEntry = new Set();
-  if (usesThreads) {
+  {
     const visit = n => {
       if (n.length === 6 && n[0] === K.Global && typeof n[3] === 'string') globalsOutsideEntry.add(n[3]);
       for (const x of n) if (Array.isArray(x)) visit(x);
     };
     for (const fn of funcs) if (fn && fn.name !== entry && Array.isArray(fn.body)) visit(fn.body);
   }
+  // with threads a jsval global other threads may touch is one packed word, so none ever
+  // reads it torn. only the main thread runs top-level code, so a global no other function
+  // uses stays a plain jsval, as without threads
   const packedGlobal = name => usesThreads && !threadGlobalSet.has(name) && globalTypeMap.get(name) === T.jsval && globalsOutsideEntry.has(name);
-  // and such a global of the program's own is a local of the entry function. the call a
-  // clean point makes into the runtime may change any global as far as the C compiler
-  // knows, which would cost it what it knew across every loop back-edge (that a value is a
-  // number, say), while it knows a local is safe. the conservative stack scan roots it like
-  // any other local. ones used in a try stay globals: a write in the try body would not
-  // survive the longjmp to the catch in a (non-volatile) local
+  // a global of the program's own that only top-level code uses is a local of the entry
+  // function. any call the C compiler cannot see through (into libc, or a clean point's into
+  // the runtime with threads) may change any global as far as it knows, which costs it what
+  // it knew about one (that it holds a number, say) across every such call, while it knows
+  // a local is safe. the conservative stack scan roots it like any other local. ones used
+  // in a try stay globals: a write in the try body would not survive the longjmp to the
+  // catch in a (non-volatile) local
   const entryLocalGlobals = new Set();
   const entryFunc = funcByName.get(entry);
-  if (usesThreads && entryFunc?.body && !needsCoro(entryFunc)) {
+  if (!split && entryFunc?.body && !needsCoro(entryFunc)) {
     const used = new Set(), inTry = new Set();
     const visit = (n, set) => {
       if (n.length === 6 && n[0] === K.Global && typeof n[3] === 'string') set.add(n[3]);
