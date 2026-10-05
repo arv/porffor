@@ -4286,7 +4286,7 @@ const generateMember = (scope, decl, objValue = null) => {
 
   const lengthMemberGet = () => {
     const lengthVal = () => Box(Convert(T.f64, LenGet(JvPtr(obj))), Const(T.i32, TYPES.number));
-    const arrayLengthVal = () => Box(Convert(T.f64, Load('u32', JvPtr(obj), 0)), Const(T.i32, TYPES.number));
+    const arrayLengthVal = () => Box(Convert(T.f64, Convert(T.u32, LenGet(JvPtr(obj)), 0)), Const(T.i32, TYPES.number));
     if (known === TYPES.array) return arrayLengthVal();
     if (Prefs.fastLength || (known != null && (known & TYPE_FLAGS.length) !== 0)) return lengthVal();
     if (known != null) return genericMemberGet();

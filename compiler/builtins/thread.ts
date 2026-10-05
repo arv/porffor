@@ -127,16 +127,18 @@ export const __Porffor_lock_acquire = (lock: Lock): void => {
   let selfId: i32 = 0;
   Porffor.c`selfId = (i32)porf_self_id();`;
   // not reentrant: taking it again would wait forever
-  if (Porffor.IR.loadI32(lock, 4) == selfId) throw new TypeError('Lock is already held by this thread');
+  let holder: i32 = 0;
+  Porffor.c`holder = __atomic_load_n((i32*)(MEM + (u32)lockAddr + 4u), __ATOMIC_RELAXED);`;
+  if (holder == selfId) throw new TypeError('Lock is already held by this thread');
 
   Porffor.c`porf_mutex_lock((u32)lockAddr);`;
-  Porffor.IR.storeI32(lock, 4, selfId);
+  Porffor.c`__atomic_store_n((i32*)(MEM + (u32)lockAddr + 4u), selfId, __ATOMIC_RELAXED);`;
 };
 
 export const __Porffor_lock_release = (lock: Lock): void => {
   const lockAddr: i32 = Porffor.IR.ptr(lock);
-  Porffor.IR.storeI32(lock, 4, 0);
-  Porffor.c`porf_mutex_unlock((u32)lockAddr);`;
+  Porffor.c`__atomic_store_n((i32*)(MEM + (u32)lockAddr + 4u), 0, __ATOMIC_RELAXED);
+porf_mutex_unlock((u32)lockAddr);`;
 };
 
 // runs fn holding the lock, releasing it however fn returns
@@ -174,7 +176,10 @@ export const __Condition_prototype_wait = function (this: Condition, lock: any, 
   if (Porffor.type(lock) != Porffor.TYPES.lock) throw new TypeError('Condition.prototype.wait: argument must be a Lock');
   let selfId: i32 = 0;
   Porffor.c`selfId = (i32)porf_self_id();`;
-  if (Porffor.IR.loadI32(lock, 4) != selfId) throw new TypeError('Condition.prototype.wait: the Lock must be held');
+  const lockAddr: i32 = Porffor.IR.ptr(lock);
+  let holder: i32 = 0;
+  Porffor.c`holder = __atomic_load_n((i32*)(MEM + (u32)lockAddr + 4u), __ATOMIC_RELAXED);`;
+  if (holder != selfId) throw new TypeError('Condition.prototype.wait: the Lock must be held');
 
   let timeoutMs: number = Infinity;
   if (Porffor.type(timeout) != Porffor.TYPES.undefined) {

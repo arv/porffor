@@ -604,15 +604,21 @@ export const __Porffor_object_checkAllFlags = (obj: any, dataAnd: i32, accessorA
   return true;
 };
 
+// the pair is one word written at once (porf_obj_store_word): read it whole, ordered like a
+// value word, as the function it points at may have just been made on another thread
 export const __Porffor_object_accessorGet = (entryPtr: i32): Function|undefined => {
-  const out: Function = Porffor.IR.loadI32(entryPtr, 8);
+  let fnPtr: i32 = 0;
+  Porffor.c`fnPtr = (i32)(u32)porf_ld_bits(MEM + (u32)entryPtr + 8u);`;
+  const out: Function = fnPtr;
 
   if (Porffor.IR.ptr(out) == 0) return undefined;
   return out;
 };
 
 export const __Porffor_object_accessorSet = (entryPtr: i32): Function|undefined => {
-  const out: Function = Porffor.IR.loadI32(entryPtr, 12);
+  let fnPtr: i32 = 0;
+  Porffor.c`fnPtr = (i32)(u32)(porf_ld_bits(MEM + (u32)entryPtr + 8u) >> 32);`;
+  const out: Function = fnPtr;
 
   if (Porffor.IR.ptr(out) == 0) return undefined;
   return out;
@@ -747,7 +753,9 @@ export const __Porffor_object_get = (_obj: any, key: any): any => {
 export const __Porffor_object_get_ic = (_obj: any, key: any, hash: i32, slot: i32): any => {
   if (Porffor.type(_obj) == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(_obj) != 0) {
-      const off: i32 = Porffor.IR.loadI32(slot, 0);
+      // the site's cache, shared by every thread: a stale offset just fails the hash check
+      let off: i32 = 0;
+      Porffor.c`off = __atomic_load_n((i32*)(MEM + (u32)slot), __ATOMIC_RELAXED);`;
       const o: i32 = Porffor.IR.ptr(_obj);
       let entriesPtr: i32 = 0;
       let size: i32 = 0;
@@ -776,7 +784,7 @@ export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot
       for (; ptr < endPtr; ptr += 24) {
         if (Porffor.IR.loadI32(ptr, 0) == hash) {
           // first writer wins so polymorphic sites miss instead of storing each time
-          if (Porffor.IR.loadI32(slot, 0) == 2147483647) Porffor.IR.storeI32(slot, 0, ptr - entriesPtr);
+          Porffor.c`{ i32 porf_ic_free_ = 2147483647; __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(ptr - entriesPtr), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); }`;
           if ((Porffor.IR.loadU16(ptr, 16) & 0b0001) == 0) return __Porffor_object_readValue(ptr);
           break;
         }

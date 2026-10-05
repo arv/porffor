@@ -364,7 +364,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     for (const fn of funcs) if (fn && fn.name !== entry && Array.isArray(fn.body)) visit(fn.body);
   }
   const packedGlobal = name => usesThreads && !threadGlobalSet.has(name) && globalTypeMap.get(name) === T.jsval && globalsOutsideEntry.has(name);
-  const globalAssign = (name, value) => packedGlobal(name) ? `${sanitize(name)} = porf_pack(${value})` : `${gname(name)} = ${value}`;
+  const globalAssign = (name, value) => packedGlobal(name) ? `porf_st_bits(&${sanitize(name)}, porf_pack(${value}))` : `${gname(name)} = ${value}`;
   // per-thread stand-ins for builtin static array literals: data segment id -> capacity
   const scratchArrs = new Map();
   const promiseResolveFunc = funcByName.get('__Porffor_promise_resolve');
@@ -530,7 +530,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
 
       case K.Global:
         cur.globals[node[N_A]] = true;
-        return [packedGlobal(node[N_A]) ? `porf_unpack(${sanitize(node[N_A])})` : gname(node[N_A]), P_POSTFIX];
+        return [packedGlobal(node[N_A]) ? `porf_unpack(porf_ld_bits(&${sanitize(node[N_A])}))` : gname(node[N_A]), P_POSTFIX];
       case K.Local:
         return [sanitize(node[N_A]), P_PRIM];
 
@@ -696,7 +696,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
       case K.Alloc: return [`porf_alloc(${rx(node[N_A], P_COMMA)}, ${node[N_B]}u)`, P_POSTFIX];
 
       case K.ArrGet: return [`porf_arr_get(${rx(node[N_A], P_COMMA)}, ${rx(node[N_B], P_COMMA)})`, P_POSTFIX];
-      case K.LenGet: return [`*(i32*)(MEM + ${rx(node[N_A], P_ADD)})`, P_UNARY];
+      case K.LenGet: return usesThreads ? [`__atomic_load_n((i32*)(MEM + ${rx(node[N_A], P_ADD)}), __ATOMIC_RELAXED)`, P_POSTFIX] : [`*(i32*)(MEM + ${rx(node[N_A], P_ADD)})`, P_UNARY];
 
       default:
         throw new Error(`render: cannot render ${KNames[node[N_KIND]]} as expression`);
@@ -960,7 +960,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
         return;
 
       case K.LenSet:
-        emit(`${ind()}*(i32*)(MEM + ${rx(node[N_A], P_ADD)}) = ${rx(node[N_B], P_COMMA)};\n`);
+        emit(usesThreads ? `${ind()}__atomic_store_n((i32*)(MEM + ${rx(node[N_A], P_ADD)}), ${rx(node[N_B], P_COMMA)}, __ATOMIC_RELAXED);\n` : `${ind()}*(i32*)(MEM + ${rx(node[N_A], P_ADD)}) = ${rx(node[N_B], P_COMMA)};\n`);
         return;
 
       case K.RawC:
@@ -3009,14 +3009,15 @@ ${st}void porf_gc_barrier_reclassify(u32 p, i32 type) {
   } else if (k == PORF_GC_PK_SPAN) {
     if ((p & PORF_GC_SPAGE_MASK) != 0u) return;
   } else return;
-  porf_gc_kinds[p >> 4] = (u8)type;
+  ${threads ? '__atomic_store_n(&porf_gc_kinds[p >> 4], (u8)type, __ATOMIC_RELAXED);' : 'porf_gc_kinds[p >> 4] = (u8)type;'}
 }
 ${sti}void porf_gc_barrier_impl(u32 p, i32 type) {
   if (porf_heap_base == 0 || p == 0) return;
-  porf_gc_cards[p >> 9] = 1;
+  // several threads may mark the same card or kind at once (whole bytes, read while stopped)
+  ${threads ? '__atomic_store_n(&porf_gc_cards[p >> 9], 1, __ATOMIC_RELAXED);' : 'porf_gc_cards[p >> 9] = 1;'}
   if (type <= 0) return;
   if (type > 195 && type < 248) return;
-  if (porf_gc_kinds[p >> 4] == (u8)type) return;
+  if (${threads ? '__atomic_load_n(&porf_gc_kinds[p >> 4], __ATOMIC_RELAXED)' : 'porf_gc_kinds[p >> 4]'} == (u8)type) return;
   porf_gc_barrier_reclassify(p, type);
 }
 static inline u32 porf_gc_barrier_ptr_u32(u32 p) { return p; }
@@ -5074,8 +5075,20 @@ PORF_NORETURN ${st}void porf_unreachable(const char* msg) {
 // value slots in memory (object entries, closure envs, array elements) are read and written
 // as one word. with threads that is a relaxed atomic: the same plain move natively, and
 // never a torn value on wasm
-${threads ? `#define porf_ld_bits(p) __atomic_load_n((jsbits*)(p), __ATOMIC_RELAXED)
-#define porf_st_bits(p, b) __atomic_store_n((jsbits*)(p), (b), __ATOMIC_RELAXED)` : `#define porf_ld_bits(p) (*(jsbits*)(p))
+${threads ? `// stores are release: a value may point at something just built (a fresh object's header,
+// a string's chars), which must be visible before the pointer. a load is ordered before
+// what it is used to reach by that address dependency (as webkit relies on); tsan does not
+// model those, so under it they are acquire
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define PORF_DEP_ORDER __ATOMIC_ACQUIRE
+#endif
+#endif
+#ifndef PORF_DEP_ORDER
+#define PORF_DEP_ORDER __ATOMIC_RELAXED
+#endif
+#define porf_ld_bits(p) __atomic_load_n((jsbits*)(p), PORF_DEP_ORDER)
+#define porf_st_bits(p, b) __atomic_store_n((jsbits*)(p), (b), __ATOMIC_RELEASE)` : `#define porf_ld_bits(p) (*(jsbits*)(p))
 #define porf_st_bits(p, b) (*(jsbits*)(p) = (b))`}
 
 #define PORF_OBJ_HDR 24u
@@ -5085,9 +5098,9 @@ ${threads ? `#define porf_ld_bits(p) __atomic_load_n((jsbits*)(p), __ATOMIC_RELA
 #define PORF_OBJ_SNAP3(o, ent, size, cap) do { const u64 porf_s_ = porf_obj_snap((u32)(o)); (ent) = (i32)(u32)porf_s_; (size) = (i32)(u16)(porf_s_ >> 32); (cap) = (i32)(u16)(porf_s_ >> 48); } while (0)
 ${threads ? `// relaxed: everything a reader then loads is reached through the entries pointer in this
 // word, so it is ordered after it (address dependency, as webkit relies on too)
-static inline u64 porf_obj_snap(u32 o) { return __atomic_load_n((u64*)(MEM + o), __ATOMIC_RELAXED); }
+static inline u64 porf_obj_snap(u32 o) { return __atomic_load_n((u64*)(MEM + o), PORF_DEP_ORDER); }
 static inline void porf_obj_publish(u32 o, u64 shape) { __atomic_store_n((u64*)(MEM + o), shape, __ATOMIC_RELEASE); }
-static inline void porf_obj_store_word(u32 p, u64 w) { __atomic_store_n((u64*)(MEM + p), w, __ATOMIC_RELAXED); }
+static inline void porf_obj_store_word(u32 p, u64 w) { __atomic_store_n((u64*)(MEM + p), w, __ATOMIC_RELEASE); }
 // ---- thread-local objects (webkit's "transition thread locality") ----
 // objects (lock word @20), arrays (@12), map/set containers (@20) and promises (@36) start
 // out owned by the thread that allocates them: the word holds its tag, (id << 12) |
@@ -5135,7 +5148,7 @@ static void porf_ttl_release_locked(porf_tstate* t) {
     if (__atomic_load_n(l, __ATOMIC_RELAXED) == pending) __atomic_store_n(l, 0u, __ATOMIC_RELEASE);
   }
   __atomic_fetch_sub(&porf_ttl_pending, t->ttl_len, __ATOMIC_RELAXED);
-  t->ttl_len = 0;
+  __atomic_store_n(&t->ttl_len, 0u, __ATOMIC_RELAXED);
   pthread_cond_broadcast(&porf_stw_cond);
 }
 
@@ -5194,7 +5207,8 @@ static PORF_COLD void porf_ttl_takeover(u32 p) {
         t->ttl_list = (u32*)realloc(t->ttl_list, (size_t)t->ttl_cap * sizeof(u32));
         if (t->ttl_list == NULL) abort();
       }
-      t->ttl_list[t->ttl_len++] = p;
+      t->ttl_list[t->ttl_len] = p;
+      __atomic_store_n(&t->ttl_len, t->ttl_len + 1u, __ATOMIC_RELAXED);
       __atomic_fetch_add(&porf_ttl_pending, 1u, __ATOMIC_SEQ_CST);
     }
     if (!parked) {
@@ -5294,8 +5308,8 @@ ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 // (a hole, the slot's initial value). writers other than the owner of a thread-local array
 // hold its lock, which the holder may take again (a builtin keeps it across a whole splice
 // while the helpers it calls lock too)
-${threads ? `#define PORF_ARR_VIEW(a, ent, cap) do { (cap) = __atomic_load_n((u32*)(MEM + (a) + 8), __ATOMIC_ACQUIRE); (ent) = __atomic_load_n((u32*)(MEM + (a) + 4), __ATOMIC_RELAXED); } while (0)
-#define PORF_ARR_LEN_LOAD(a) __atomic_load_n((i32*)(MEM + (a)), __ATOMIC_RELAXED)
+${threads ? `#define PORF_ARR_VIEW(a, ent, cap) do { (cap) = __atomic_load_n((u32*)(MEM + (a) + 8), __ATOMIC_ACQUIRE); (ent) = __atomic_load_n((u32*)(MEM + (a) + 4), PORF_DEP_ORDER); } while (0)
+#define PORF_ARR_LEN_LOAD(a) __atomic_load_n((i32*)(MEM + (a)), PORF_DEP_ORDER)
 #define PORF_ARR_LEN_STORE(a, n) __atomic_store_n((i32*)(MEM + (a)), (n), __ATOMIC_RELAXED)
 #define porf_arr_lock(a) porf_rlock((u32)(a) + 12u)
 #define porf_arr_unlock(a) porf_runlock((u32)(a) + 12u)
