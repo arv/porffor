@@ -364,6 +364,29 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     for (const fn of funcs) if (fn && fn.name !== entry && Array.isArray(fn.body)) visit(fn.body);
   }
   const packedGlobal = name => usesThreads && !threadGlobalSet.has(name) && globalTypeMap.get(name) === T.jsval && globalsOutsideEntry.has(name);
+  // and such a global of the program's own is a local of the entry function. the call a
+  // clean point makes into the runtime may change any global as far as the C compiler
+  // knows, which would cost it what it knew across every loop back-edge (that a value is a
+  // number, say), while it knows a local is safe. the conservative stack scan roots it like
+  // any other local. ones used in a try stay globals: a write in the try body would not
+  // survive the longjmp to the catch in a (non-volatile) local
+  const entryLocalGlobals = new Set();
+  const entryFunc = funcByName.get(entry);
+  if (usesThreads && entryFunc?.body && !needsCoro(entryFunc)) {
+    const used = new Set(), inTry = new Set();
+    const visit = (n, set) => {
+      if (n.length === 6 && n[0] === K.Global && typeof n[3] === 'string') set.add(n[3]);
+      if (n[0] === K.Try && set === used) visit(n, inTry);
+      for (const x of n) if (Array.isArray(x)) visit(x, set);
+    };
+    visit(entryFunc.body, used);
+    const taken = new Set([ ...Object.keys(entryFunc.locals ?? {}), ...entryFunc.params.map(p => p.name) ].map(sanitize));
+    for (const g of globals) {
+      if (g.builtin || g.name.startsWith('#') || threadGlobalSet.has(g.name) || globalsOutsideEntry.has(g.name)) continue;
+      if (!used.has(g.name) || inTry.has(g.name) || taken.has(sanitize(g.name))) continue;
+      entryLocalGlobals.add(g.name);
+    }
+  }
   const globalAssign = (name, value) => packedGlobal(name) ? `porf_st_bits(&${sanitize(name)}, porf_pack(${value}))` : `${gname(name)} = ${value}`;
   // per-thread stand-ins for builtin static array literals: data segment id -> capacity
   const scratchArrs = new Map();
@@ -1439,6 +1462,10 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
       const q = allocd.has(name) && (t === T.i32 || t === T.u32) ? 'PORF_ROOT ' : rootQual(t);
       emit(`  ${q}${CT[t]} ${sanitize(name)}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
     }
+    if (f === entryFunc) for (const name of entryLocalGlobals) {
+      const t = globalTypeMap.get(name);
+      emit(`  ${rootQual(t)}${CT[t]} ${sanitize(name)}${t === T.jsval ? ' = JV_UNDEFINED' : ' = 0'};\n`);
+    }
     renderStmts(f.body);
     emit(`}\n\n`);
   };
@@ -1561,7 +1588,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
 
   // module globals (top-level JS bindings)
   for (const g of globals) {
-    if (threadGlobalSet.has(g.name)) continue;
+    if (threadGlobalSet.has(g.name) || entryLocalGlobals.has(g.name)) continue;
     if (packedGlobal(g.name)) { link.push(`${st}jsbits ${sanitize(g.name)} = JV_UNDEFINED_BITS;\n`); continue; }
     link.push(`${st}${CT[g.type]} ${sanitize(g.name)}${g.type === T.jsval ? ` = {0.0, ${TYPES.undefined}}` : ''};\n`);
   }
@@ -1577,6 +1604,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     const markThreadRootLines = [];
     const markThreadRawLines = [];
     for (const g of globals) {
+      if (entryLocalGlobals.has(g.name)) continue;
       const name = gname(g.name);
       const perThread = threadGlobalSet.has(g.name);
       const rootLines = perThread ? markThreadRootLines : markGlobalRootLines;
