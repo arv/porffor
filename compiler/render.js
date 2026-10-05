@@ -1722,6 +1722,7 @@ ${st}jsval porf_promise_settled(PORF_ROOT jsval value, i32 state) {
   *(u8*)(MEM + p + PORF_PROMISE_STATE) = (u8)state;
   *(u8*)(MEM + p + PORF_PROMISE_FLAGS) = 0;
   *(u8*)(MEM + p + PORF_PROMISE_HANDLED) = 0;
+  *(u32*)(MEM + p + PORF_PROMISE_LOCK) = 0;
   return porf_box((f64)p, ${TYPES.promise});
 }
 
@@ -4743,6 +4744,7 @@ ${threads ? THREAD_HEAD() : '#define porf_builtin_lock() ((void)0)\n#define porf
 #define PORF_PROMISE_STATE 32
 #define PORF_PROMISE_FLAGS 33
 #define PORF_PROMISE_HANDLED 34
+#define PORF_PROMISE_LOCK 36 // with threads: held to settle, or to check state and add reactions
 #define PORF_PROMISE_SIZE 40
 
 #define PORF_REACTION_HANDLER 0
@@ -5721,6 +5723,7 @@ static jsval porf_promise_pending(void) {
   *(u8*)(MEM + p + PORF_PROMISE_STATE) = 0;
   *(u8*)(MEM + p + PORF_PROMISE_FLAGS) = 0;
   *(u8*)(MEM + p + PORF_PROMISE_HANDLED) = 0;
+  *(u32*)(MEM + p + PORF_PROMISE_LOCK) = 0;
   return porf_box((f64)p, ${TYPES.promise});
 }
 
@@ -5738,7 +5741,11 @@ static void porf_promise_trigger_reactions(u32 reaction, jsval value) {
 static void porf_promise_settle_direct(jsval promise, jsval value, i32 state) {
   if (promise.type != ${TYPES.promise}) return;
   const u32 p = (u32)promise.val;
-  if (*(u8*)(MEM + p + PORF_PROMISE_STATE) != 0) return;
+  porf_rlock(p + PORF_PROMISE_LOCK);
+  if (*(u8*)(MEM + p + PORF_PROMISE_STATE) != 0) {
+    porf_runlock(p + PORF_PROMISE_LOCK);
+    return;
+  }
   const u32 reactions = *(u32*)(MEM + p + (state == 1 ? PORF_PROMISE_FULFILL_HEAD : PORF_PROMISE_REJECT_HEAD));
   *(jsbits*)(MEM + p + PORF_PROMISE_RESULT) = porf_pack(value);
   *(u32*)(MEM + p + PORF_PROMISE_FULFILL_HEAD) = 0;
@@ -5746,6 +5753,7 @@ static void porf_promise_settle_direct(jsval promise, jsval value, i32 state) {
   *(u32*)(MEM + p + PORF_PROMISE_REJECT_HEAD) = 0;
   *(u32*)(MEM + p + PORF_PROMISE_REJECT_TAIL) = 0;
   *(u8*)(MEM + p + PORF_PROMISE_STATE) = (u8)state;
+  porf_runlock(p + PORF_PROMISE_LOCK);
   porf_gc_barrier(p, ${TYPES.promise});
   porf_promise_trigger_reactions(reactions, value);
 }
@@ -5781,8 +5789,22 @@ static void porf_promise_attach_coro(PORF_ROOT jsval awaited, porf_coro_call* PO
   if (awaited.type != ${TYPES.promise}) porf_unreachable("coroutine awaited non-pending non-promise");
   const u32 p = (u32)awaited.val;
   *(u8*)(MEM + p + PORF_PROMISE_HANDLED) = 1;
-  porf_promise_append_raw_reaction(p, porf_promise_new_coro_reaction(call, out_promise, 0), 0);
-  porf_promise_append_raw_reaction(p, porf_promise_new_coro_reaction(call, out_promise, 1), 1);
+  PORF_ROOT const u32 on_fulfill = porf_promise_new_coro_reaction(call, out_promise, 0);
+  PORF_ROOT const u32 on_reject = porf_promise_new_coro_reaction(call, out_promise, 1);
+  porf_rlock(p + PORF_PROMISE_LOCK);
+  const u8 state = *(u8*)(MEM + p + PORF_PROMISE_STATE);
+  if (state == 0) {
+    porf_promise_append_raw_reaction(p, on_fulfill, 0);
+    porf_promise_append_raw_reaction(p, on_reject, 1);
+  }
+  porf_runlock(p + PORF_PROMISE_LOCK);
+  if (state == 0) return;
+
+  // another thread settled it since the await saw it pending: resume through a job, as then would
+  const u32 reaction = state == 1 ? on_fulfill : on_reject;
+  *(jsbits*)(MEM + reaction + PORF_REACTION_VALUE) = *(jsbits*)(MEM + p + PORF_PROMISE_RESULT);
+  porf_gc_barrier(reaction, PORF_GC_KIND_PROMISE_REACTION);
+  porf_promise_enqueue_job(reaction);
 }
 
 static void porf_coro_init(porf_coro_call* c, u32 heap, u32 frame, u32 idx, jsval callee, u32 env, jsval thisv, jsval newtv, i32 argc, jsbits* argv) {

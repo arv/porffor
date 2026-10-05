@@ -118,7 +118,12 @@ export const __ecma262_TriggerPromiseReactions = (reactions: i32, argument: any)
 };
 
 export const __ecma262_FulfillPromise = (promise: any, value: any): void => {
-  if (__Porffor_promise_state(promise) != 0) return;
+  // with threads another thread may settle it at the same time: one wins
+  __Porffor_rlock(Porffor.IR.ptr(promise) + 36);
+  if (__Porffor_promise_state(promise) != 0) {
+    __Porffor_runlock(Porffor.IR.ptr(promise) + 36);
+    return;
+  }
 
   const reactions: i32 = Porffor.IR.loadI32(promise, 8);
   Porffor.IR.storeJv(promise, 0, value);
@@ -127,13 +132,19 @@ export const __ecma262_FulfillPromise = (promise: any, value: any): void => {
   Porffor.IR.storeI32(promise, 16, 0);
   Porffor.IR.storeI32(promise, 20, 0);
   Porffor.IR.storeU8(promise, 32, 1);
+  __Porffor_runlock(Porffor.IR.ptr(promise) + 36);
   Porffor.IR.gcBarrier(promise, Porffor.TYPES.promise);
 
   __ecma262_TriggerPromiseReactions(reactions, value);
 };
 
 export const __ecma262_RejectPromise = (promise: any, reason: any): void => {
-  if (__Porffor_promise_state(promise) != 0) return;
+  // with threads another thread may settle it at the same time: one wins
+  __Porffor_rlock(Porffor.IR.ptr(promise) + 36);
+  if (__Porffor_promise_state(promise) != 0) {
+    __Porffor_runlock(Porffor.IR.ptr(promise) + 36);
+    return;
+  }
 
   const reactions: i32 = Porffor.IR.loadI32(promise, 16);
   Porffor.IR.storeJv(promise, 0, reason);
@@ -142,6 +153,7 @@ export const __ecma262_RejectPromise = (promise: any, reason: any): void => {
   Porffor.IR.storeI32(promise, 16, 0);
   Porffor.IR.storeI32(promise, 20, 0);
   Porffor.IR.storeU8(promise, 32, 2);
+  __Porffor_runlock(Porffor.IR.ptr(promise) + 36);
   Porffor.IR.gcBarrier(promise, Porffor.TYPES.promise);
 
   if (!__Porffor_promise_isHandled(promise)) Porffor.array.fastPush(pendingRejections, promise);
@@ -150,15 +162,20 @@ export const __ecma262_RejectPromise = (promise: any, reason: any): void => {
 };
 
 export const __Porffor_then = (promise: any, fulfillReaction: i32, rejectReaction: i32): void => {
+  // the state check and adding reactions are one step against a settle on another thread
+  __Porffor_rlock(Porffor.IR.ptr(promise) + 36);
   const state: i32 = __Porffor_promise_state(promise);
   __Porffor_promise_setHandled(promise);
 
   if (state == 0) {
     __Porffor_promise_appendFulfillReaction(promise, fulfillReaction);
     __Porffor_promise_appendRejectReaction(promise, rejectReaction);
-  } else if (state == 1) {
+  }
+  __Porffor_runlock(Porffor.IR.ptr(promise) + 36);
+
+  if (state == 1) {
     __Porffor_promise_enqueueReaction(fulfillReaction, __Porffor_promise_result(promise));
-  } else {
+  } else if (state == 2) {
     __Porffor_promise_enqueueReaction(rejectReaction, __Porffor_promise_result(promise));
   }
 };
@@ -226,6 +243,7 @@ export const __Porffor_promise_create = (): Promise => {
   Porffor.IR.storeJv(obj, 24, undefined);
   Porffor.IR.storeU8(obj, 32, 0);
   Porffor.IR.storeU8(obj, 34, 0);
+  Porffor.IR.storeI32(obj, 36, 0);
   return obj;
 };
 
