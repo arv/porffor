@@ -985,7 +985,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
         return;
 
       case K.LenSet:
-        emit(usesThreads ? `${ind()}__atomic_store_n((i32*)(MEM + ${rx(node[N_A], P_ADD)}), ${rx(node[N_B], P_COMMA)}, __ATOMIC_RELAXED);\n` : `${ind()}*(i32*)(MEM + ${rx(node[N_A], P_ADD)}) = ${rx(node[N_B], P_COMMA)};\n`);
+        emit(usesThreads ? `${ind()}PORF_ST_RLX((i32*)(MEM + ${rx(node[N_A], P_ADD)}), ${rx(node[N_B], P_COMMA)});\n` : `${ind()}*(i32*)(MEM + ${rx(node[N_A], P_ADD)}) = ${rx(node[N_B], P_COMMA)};\n`);
         return;
 
       case K.RawC:
@@ -3091,7 +3091,7 @@ ${st}void porf_gc_barrier_reclassify(u32 p, i32 type) {
 ${sti}void porf_gc_barrier_impl(u32 p, i32 type) {
   if (porf_heap_base == 0 || p == 0) return;
   // several threads may mark the same card or kind at once (whole bytes, read while stopped)
-  ${threads ? '__atomic_store_n(&porf_gc_cards[p >> 9], 1, __ATOMIC_RELAXED);' : 'porf_gc_cards[p >> 9] = 1;'}
+  ${threads ? 'PORF_ST_RLX(&porf_gc_cards[p >> 9], 1);' : 'porf_gc_cards[p >> 9] = 1;'}
   if (type <= 0) return;
   if (type > 195 && type < 248) return;
   if (${threads ? 'PORF_LD_RLX(&porf_gc_kinds[p >> 4])' : 'porf_gc_kinds[p >> 4]'} == (u8)type) return;
@@ -4557,7 +4557,7 @@ static PORF_NOINLINE void porf_park(void) {
   pthread_mutex_unlock(&porf_stw_lock);
 }
 
-#define PORF_SAFEPOINT() do { if (__builtin_expect(__atomic_load_n(&porf_stw_requested, __ATOMIC_ACQUIRE), 0)) porf_park(); } while (0)
+#define PORF_SAFEPOINT() do { if (__builtin_expect(PORF_LD_RLX(&porf_stw_requested), 0)) porf_park(); } while (0)
 
 // a thread blocked in a wait counts as parked, so collections need not wait for it.
 // the stack is saved in the caller's frame: enter is a macro, not a call
@@ -5168,7 +5168,8 @@ ${threads ? `// stores are release: a value may point at something just built (a
 #else
 #define PORF_DEP_ORDER __ATOMIC_RELAXED
 #endif
-// the common relaxed (PORF_LD_RLX) and dependency-ordered (PORF_LD_DEP) loads. gcc sizes an
+// the common relaxed (PORF_LD_RLX) and dependency-ordered (PORF_LD_DEP) loads, and relaxed
+// stores (PORF_ST_RLX). gcc sizes an
 // __atomic builtin like a call when deciding what to inline, which cost threaded builds much
 // of their inlining (Map get stopped inlining: +37% on a Map loop); a volatile load is the
 // same single load (aligned, at most a word, never torn or repeated) and sizes as one. clang
@@ -5176,9 +5177,11 @@ ${threads ? `// stores are release: a value may point at something just built (a
 #if defined(__GNUC__) && !defined(__clang__) && !defined(PORF_TSAN)
 #define PORF_LD_RLX(p) (*(volatile __typeof__(*(p))*)(p))
 #define PORF_LD_DEP(p) (*(volatile __typeof__(*(p))*)(p))
+#define PORF_ST_RLX(p, v) (*(volatile __typeof__(*(p))*)(p) = (v))
 #else
 #define PORF_LD_RLX(p) __atomic_load_n((p), __ATOMIC_RELAXED)
 #define PORF_LD_DEP(p) __atomic_load_n((p), PORF_DEP_ORDER)
+#define PORF_ST_RLX(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
 #endif
 #define porf_ld_bits(p) PORF_LD_DEP((jsbits*)(p))
 #define porf_st_bits(p, b) __atomic_store_n((jsbits*)(p), (b), __ATOMIC_RELEASE)` : `#define PORF_LD_RLX(p) (*(p))
@@ -5348,12 +5351,17 @@ static inline void porf_rlock(u32 p) {
   if (__builtin_expect(porf_ttl_mine(p), 1)) return;
   porf_rlock_slow(p, porf_self_tag());
 }
-static inline void porf_runlock(u32 p) {
+static PORF_COLD void porf_runlock_slow(u32 p, u32 v) {
   u32* l = (u32*)(MEM + p);
-  const u32 v = PORF_LD_RLX(l);
-  if (v & PORF_TTL_LOCAL) return;
   if ((v & PORF_TTL_DEPTH) == 1u) __atomic_store_n(l, 0u, __ATOMIC_RELEASE);
     else __atomic_store_n(l, v - 1u, __ATOMIC_RELAXED);
+}
+// the release stays out of line: inline, its atomic stores kept callers from inlining
+// under gcc (which sizes them like calls)
+static inline void porf_runlock(u32 p) {
+  const u32 v = PORF_LD_RLX((u32*)(MEM + p));
+  if (__builtin_expect((v & PORF_TTL_LOCAL) != 0, 1)) return;
+  porf_runlock_slow(p, v);
 }
 #define porf_obj_lock(o) porf_rlock((u32)(o) + 20u)
 #define porf_obj_unlock(o) porf_runlock((u32)(o) + 20u)
@@ -5405,7 +5413,7 @@ ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 // while the helpers it calls lock too)
 ${threads ? `#define PORF_ARR_VIEW(a, ent, cap) do { (cap) = __atomic_load_n((u32*)(MEM + (a) + 8), __ATOMIC_ACQUIRE); (ent) = PORF_LD_DEP((u32*)(MEM + (a) + 4)); } while (0)
 #define PORF_ARR_LEN_LOAD(a) PORF_LD_DEP((i32*)(MEM + (a)))
-#define PORF_ARR_LEN_STORE(a, n) __atomic_store_n((i32*)(MEM + (a)), (n), __ATOMIC_RELAXED)
+#define PORF_ARR_LEN_STORE(a, n) PORF_ST_RLX((i32*)(MEM + (a)), (n))
 #define porf_arr_lock(a) porf_rlock((u32)(a) + 12u)
 #define porf_arr_unlock(a) porf_runlock((u32)(a) + 12u)
 // clear or move whole value words, so a racing reader never sees a torn one
