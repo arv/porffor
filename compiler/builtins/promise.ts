@@ -353,10 +353,15 @@ export const __Porffor_promise_runOne = (reaction: i32): void => {
 
 export const __Porffor_promise_runJobs = (): void => {
   while (true) {
-    const reaction: i32 = __Porffor_promise_dequeueReaction();
-    if (reaction == 0) break;
+    while (true) {
+      const reaction: i32 = __Porffor_promise_dequeueReaction();
+      if (reaction == 0) break;
 
-    __Porffor_promise_runOne(reaction);
+      __Porffor_promise_runOne(reaction);
+    }
+
+    // out of jobs: a thread awaited through asyncJoin may still settle a promise
+    if (!__Porffor_thread_settleJoin()) break;
   }
 
   while (pendingRejections.length > 0) {

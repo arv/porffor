@@ -55,6 +55,50 @@ export const __Thread_prototype_join = function (this: Thread) {
   return Porffor.IR.loadJv(this, 0);
 };
 
+// threads awaited through asyncJoin, each followed by its promise
+const pendingJoins: any[] = [];
+
+// the result as a promise, for code that should not block: the job loop settles it once it
+// has nothing else to run (see __Porffor_thread_settleJoin)
+export const __Thread_prototype_asyncJoin = function (this: Thread) {
+  const promise: Promise = __Porffor_promise_create();
+  Porffor.array.fastPush(pendingJoins, this);
+  Porffor.array.fastPush(pendingJoins, promise);
+  return promise;
+};
+
+// settles one asyncJoin promise, a finished thread's first, else waiting (as parked) for
+// the oldest. false when none are pending
+export const __Porffor_thread_settleJoin = (): boolean => {
+  const n: i32 = pendingJoins.length;
+  if (n == 0) return false;
+
+  let pick: i32 = 0;
+  for (let i: i32 = 0; i < n; i += 2) {
+    const threadPtr: i32 = Porffor.IR.ptr(pendingJoins[i]);
+    let done: i32 = 0;
+    Porffor.c`done = __atomic_load_n((u8*)(MEM + (u32)threadPtr + 16u), __ATOMIC_ACQUIRE);`;
+    if (done) {
+      pick = i;
+      break;
+    }
+  }
+
+  const thread: Thread = pendingJoins[pick];
+  const promise: any = pendingJoins[pick + 1];
+  pendingJoins.splice(pick, 2);
+
+  const threadPtr: i32 = Porffor.IR.ptr(thread);
+  Porffor.c`
+#if PORF_THREADED
+porf_thread_join((u32)threadPtr);
+#endif
+`;
+  if (Porffor.IR.loadU8(thread, 17) == 1) __ecma262_RejectPromise(promise, Porffor.IR.loadJv(thread, 0));
+    else __Porffor_promise_resolve(Porffor.IR.loadJv(thread, 0), promise);
+  return true;
+};
+
 export const __Thread_prototype_toString = function (this: Thread) { return '[object Thread]'; };
 export const __Thread_prototype_toLocaleString = function (this: Thread) { return Porffor.callThis(__Thread_prototype_toString, this); };
 
