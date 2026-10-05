@@ -755,7 +755,7 @@ export const __Porffor_object_get_ic = (_obj: any, key: any, hash: i32, slot: i3
     if (Porffor.IR.ptr(_obj) != 0) {
       // the site's cache, shared by every thread: a stale offset just fails the hash check
       let off: i32 = 0;
-      Porffor.c`off = __atomic_load_n((i32*)(MEM + (u32)slot), __ATOMIC_RELAXED);`;
+      Porffor.c`off = PORF_LD_RLX((i32*)(MEM + (u32)slot));`;
       const o: i32 = Porffor.IR.ptr(_obj);
       let entriesPtr: i32 = 0;
       let size: i32 = 0;
