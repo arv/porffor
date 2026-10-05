@@ -3416,7 +3416,8 @@ static void porf_gc_mark_native_roots(void) {
 static void porf_gc_mark_array_entries(i32 entries, u32 len) {
   for (u32 i = 0; i < len; i++) {
     const jsbits b = *(jsbits*)(MEM + entries + ((u64)i << 3));
-    if (b == 0) continue;
+    // all ones is a deleted hashtable key, not a pointer
+    if (b == 0 || b == 0xffffffffffffffffull) continue;
     const jsval v = porf_unpack(b);
     if (porf_gc_type_can_reference(v.type)) porf_gc_mark_js(v.val, v.type);
   }
