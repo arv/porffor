@@ -352,7 +352,18 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
   const gname = name => threadGlobalSet.has(name) ? `porf_ts->tg->${sanitize(name)}` : sanitize(name);
   // jsval globals every thread shares live as one packed word, so racing writes never tear
   const globalTypeMap = new Map(globals.map(g => [ g.name, g.type ]));
-  const packedGlobal = name => usesThreads && !threadGlobalSet.has(name) && globalTypeMap.get(name) === T.jsval;
+  // with threads a jsval global other threads may touch is one packed word, so none ever
+  // reads it torn. only the main thread runs top-level code (the entry function), so a
+  // global no other function uses stays a plain jsval, as without threads
+  const globalsOutsideEntry = new Set();
+  if (usesThreads) {
+    const visit = n => {
+      if (n.length === 6 && n[0] === K.Global && typeof n[3] === 'string') globalsOutsideEntry.add(n[3]);
+      for (const x of n) if (Array.isArray(x)) visit(x);
+    };
+    for (const fn of funcs) if (fn && fn.name !== entry && Array.isArray(fn.body)) visit(fn.body);
+  }
+  const packedGlobal = name => usesThreads && !threadGlobalSet.has(name) && globalTypeMap.get(name) === T.jsval && globalsOutsideEntry.has(name);
   const globalAssign = (name, value) => packedGlobal(name) ? `${sanitize(name)} = porf_pack(${value})` : `${gname(name)} = ${value}`;
   // per-thread stand-ins for builtin static array literals: data segment id -> capacity
   const scratchArrs = new Map();
@@ -773,7 +784,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
         depth++;
         // builtins only reach a collection at allocations, which their internal tables rely
         // on (eg the gc drops the underlying store's buckets), so only user loops get one
-        if (usesThreads && !curInternal) emit(`${ind()}PORF_SAFEPOINT();\n`);
+        if (usesThreads && !curInternal) emit(`${ind()}PORF_CLEAN_POINT();\n`);
         renderStmts(stmts);
         if (region) coro.path.pop();
         if (label && usedLabels.has(label + '_c')) emit(`${ind()}${sanitize(label)}_c:;\n`);
@@ -1722,7 +1733,7 @@ ${st}jsval porf_promise_settled(PORF_ROOT jsval value, i32 state) {
   *(u8*)(MEM + p + PORF_PROMISE_STATE) = (u8)state;
   *(u8*)(MEM + p + PORF_PROMISE_FLAGS) = 0;
   *(u8*)(MEM + p + PORF_PROMISE_HANDLED) = 0;
-  *(u32*)(MEM + p + PORF_PROMISE_LOCK) = 0;
+  *(u32*)(MEM + p + PORF_PROMISE_LOCK) = porf_self_tag();
   return porf_box((f64)p, ${TYPES.promise});
 }
 
@@ -1756,7 +1767,7 @@ ${st}jsval porf_async_call_sync(u32 idx, jsval callee, u32 env, jsval thisv, jsv
 	  if (cap < len) cap = len;
 	  if (cap < 4) cap = 4;
 	  const u32 a = porf_alloc(16 + ((u32)cap << 3), type);
-	  PORF_ARR_LEN(a) = len; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap; *(u32*)(MEM + a + 12) = 0;
+	  PORF_ARR_LEN(a) = len; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap; *(u32*)(MEM + a + 12) = porf_self_tag();
 	  memset(MEM + PORF_ARR_ENT(a), 0, (size_t)cap << 3);
 	  return a;
 	}
@@ -2257,7 +2268,7 @@ int porf_native_fetch_read_value(jsval value, const char** out_buf, size_t* out_
   }
 
   if (entry && !prefs.nativeFetch) {
-    emit(`int main(int argc, char** argv) {\n  ${usesThreads ? 'porf_main_ts.tg = &porf_main_tg;\n  ' : ''}porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n  ${usesThreads ? 'porf_threads_finish();\n  ' : ''}return 0;\n}\n`);
+    emit(`int main(int argc, char** argv) {\n  ${usesThreads ? 'porf_ttl_init();\n  porf_main_ts.tg = &porf_main_tg;\n  ' : ''}porf_init(argc, argv);\n  porf_data_init();\n  ${gcEnabled ? 'volatile int porf_stack_anchor = 0;\n  porf_c_stack_top = (void*)&porf_stack_anchor;\n  ' : ''}${fnSym(funcByName.get(entry))}();\n  ${usesThreads ? 'porf_threads_finish();\n  ' : ''}return 0;\n}\n`);
   }
 
   if (usesMath) prelude.splice(1, 0, '#include <math.h>\n');
@@ -4251,7 +4262,7 @@ ${st}void porf_gc_collect(int minor) {
   porf_gc_collector = self;
   porf_gc_collect_impl(minor);
   porf_gc_collector = NULL;
-  porf_ts = self;
+  porf_ts_set(self);
   pthread_mutex_lock(&porf_stw_lock);
   __atomic_store_n(&porf_stw_requested, 0, __ATOMIC_RELEASE);
   pthread_cond_broadcast(&porf_stw_cond);
@@ -4261,10 +4272,10 @@ ${st}void porf_gc_collect(int minor) {
 
 static void porf_gc_collect_impl(int minor) {
   for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
-    porf_ts = t;
+    porf_ts_set(t);
     for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) porf_gc_publish_window(ci);
   }
-  porf_ts = porf_gc_collector;` : `${st}void porf_gc_collect(int minor) {
+  porf_ts_set(porf_gc_collector);` : `${st}void porf_gc_collect(int minor) {
   if (porf_heap_base == 0) return;
   for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) porf_gc_publish_window(ci);`}
   porf_gc_minor_mode = minor;
@@ -4284,7 +4295,7 @@ static void porf_gc_collect_impl(int minor) {
   porf_gc_boxed_marks_len = 0;
   porf_gc_mark_native_roots();
 ${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
-    porf_ts = t;
+    porf_ts_set(t);
     porf_gc_mark_cons_roots();
     porf_gc_mark_js(porf_exception.val, porf_exception.type);
     porf_gc_mark_js(porf_iter_open.val, porf_iter_open.type);
@@ -4292,7 +4303,7 @@ ${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
     if (t->thread_obj != 0) porf_gc_mark_js((f64)t->thread_obj, ${TYPES.thread});
     porf_gc_mark_thread_global_roots();
   }
-  porf_ts = porf_gc_collector;` : `  porf_gc_mark_cons_roots();
+  porf_ts_set(porf_gc_collector);` : `  porf_gc_mark_cons_roots();
   porf_gc_mark_js(porf_exception.val, porf_exception.type);
   porf_gc_mark_js(porf_iter_open.val, porf_iter_open.type);`}
   porf_gc_mark_global_roots();
@@ -4300,10 +4311,10 @@ ${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
   if (minor) porf_gc_scan_cards();
   porf_gc_mark_global_raw_roots();
 ${threads ? `  for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
-    porf_ts = t;
+    porf_ts_set(t);
     porf_gc_mark_thread_global_raw_roots();
   }
-  porf_ts = porf_gc_collector;
+  porf_ts_set(porf_gc_collector);
 ` : ''}\
   porf_gc_drain_mark_queue();
   porf_gc_process_weakmaps();
@@ -4390,7 +4401,10 @@ typedef struct porf_tstate {
   i32 builtin_lock_depth;
   struct porf_tglobals* tg;
   u32 thread_obj;
-  u32 lock_id; // owner tag in array locks: a unique id << 12
+  u32 lock_id; // a unique id << 12: owner tags (| PORF_TTL_LOCAL) and lock holders
+  u32* ttl_list; // lock words other threads want shared, handed over at a clean point
+  u32 ttl_len, ttl_cap;
+  i32 ttl_clean; // in a blocking wait between operations
   jsval coro_value; // what the last generator this thread resumed produced (coro_gen)
   u32 coro_gen;
   i32 coro_raw;
@@ -4400,7 +4414,27 @@ typedef struct porf_tstate {
 } porf_tstate;
 
 static porf_tstate porf_main_ts;
-static _Thread_local porf_tstate* porf_ts = &porf_main_ts;
+// the current thread's state. read everywhere (try depth, allocation windows...), and a
+// _Thread_local read is a call on darwin, so there it lives in a fixed thread-specific
+// slot instead. porf_ttl_init sets it up first thing
+#if defined(__APPLE__) && defined(__aarch64__)
+// two of the thread-specific slots darwin reserves for JavaScriptCore, which uses them the
+// same way (WTF FastTLS): read at a fixed offset from the thread's TSD, written directly.
+// porffor programs never load JavaScriptCore
+#define PORF_TSD_TS 93
+#define PORF_TSD_TAG 94
+static inline uintptr_t* porf_tsd(void) {
+  uintptr_t tsd;
+  __asm__("mrs %0, tpidrro_el0" : "=r"(tsd));
+  return (uintptr_t*)(tsd & ~(uintptr_t)7);
+}
+#define porf_ts ((porf_tstate*)porf_tsd()[PORF_TSD_TS])
+#define porf_ts_set(t) (porf_tsd()[PORF_TSD_TS] = (uintptr_t)(t))
+#else
+static _Thread_local porf_tstate* porf_ts_v = &porf_main_ts;
+#define porf_ts porf_ts_v
+#define porf_ts_set(t) (porf_ts_v = (t))
+#endif
 
 #define porf_try_data (porf_ts->try_data)
 #define porf_try_cap (porf_ts->try_cap)
@@ -4421,7 +4455,11 @@ static _Thread_local porf_tstate* porf_ts = &porf_main_ts;
 static porf_tstate* porf_threads = &porf_main_ts;
 static i32 porf_threads_n = 1;
 static i32 porf_threads_parked = 0;
-static i32 porf_stw_requested = 0;
+// what a clean point polls, in one load: a collection wanting every thread stopped, and
+// takeovers waiting for their owner (see thread-local objects)
+static union { u64 any; struct { i32 stw; u32 ttl; } f; } porf_poll_req;
+#define porf_stw_requested (porf_poll_req.f.stw)
+#define porf_ttl_pending (porf_poll_req.f.ttl)
 static pthread_mutex_t porf_stw_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t porf_stw_cond = PTHREAD_COND_INITIALIZER;
 
@@ -4477,12 +4515,17 @@ static void porf_gc_lock_release(void) {
 // guards builtin tables every thread shares (symbol registry, hidden props). reentrant,
 // and a waiter counts as parked like with the gc lock
 static pthread_mutex_t porf_builtin_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void porf_ttl_clean_enter(void);
+static void porf_ttl_clean_exit(void);
 static void porf_builtin_lock(void) {
   if (porf_ts->builtin_lock_depth++ > 0) return;
   if (pthread_mutex_trylock(&porf_builtin_mutex) == 0) return;
+  // taken between operations, so waiting for it is a clean point (see thread-local objects)
+  porf_ttl_clean_enter();
   porf_blocking_enter();
   pthread_mutex_lock(&porf_builtin_mutex);
   porf_blocking_exit();
+  porf_ttl_clean_exit();
 }
 static void porf_builtin_unlock(void) {
   if (--porf_ts->builtin_lock_depth == 0) pthread_mutex_unlock(&porf_builtin_mutex);
@@ -4524,6 +4567,7 @@ static void porf_thread_register(porf_tstate* t) {
 // caller holds the gc lock
 static void porf_thread_unlink(porf_tstate* t) {
   pthread_mutex_lock(&porf_stw_lock);
+  porf_ttl_release_locked(t);
   for (porf_tstate** p = &porf_threads; *p != NULL; p = &(*p)->next) {
     if (*p == t) { *p = t->next; break; }
   }
@@ -4546,12 +4590,14 @@ static void porf_thread_free(porf_tstate* t) {
   free(t->job_queue);
   free(t->gc_active);
   free(t->tg);
+  free(t->ttl_list);
   free(t);
 }
 
 static void* porf_thread_main(void* arg) {
   porf_tstate* t = (porf_tstate*)arg;
-  porf_ts = t;
+  porf_ts_set(t);
+  porf_set_self_tag(t->lock_id | PORF_TTL_LOCAL);
   volatile int porf_stack_anchor = 0;
   t->c_stack_top = (void*)&porf_stack_anchor;
 ${initCall ? `  ${initCall};\n` : ''}\
@@ -4611,12 +4657,14 @@ static i32 porf_thread_spawn(u32 obj) {
 
 static void porf_thread_join(u32 obj) {
   if (__atomic_load_n(PORF_THREAD_STATE(obj), __ATOMIC_ACQUIRE)) return;
+  porf_ttl_clean_enter();
   porf_blocking_enter();
   pthread_mutex_lock(&porf_thread_done_lock);
   while (!__atomic_load_n(PORF_THREAD_STATE(obj), __ATOMIC_ACQUIRE))
     pthread_cond_wait(&porf_thread_done_cond, &porf_thread_done_lock);
   pthread_mutex_unlock(&porf_thread_done_lock);
   porf_blocking_exit();
+  porf_ttl_clean_exit();
 }
 
 // the process lives until every thread has finished
@@ -4625,11 +4673,13 @@ static void porf_threads_finish(void) {
   const i32 live = porf_threads_live;
   pthread_mutex_unlock(&porf_thread_done_lock);
   if (live == 0) return;
+  porf_ttl_clean_enter();
   porf_blocking_enter();
   pthread_mutex_lock(&porf_thread_done_lock);
   while (porf_threads_live > 0) pthread_cond_wait(&porf_thread_done_cond, &porf_thread_done_lock);
   pthread_mutex_unlock(&porf_thread_done_lock);
   porf_blocking_exit();
+  porf_ttl_clean_exit();
 }
 
 `;
@@ -4693,6 +4743,8 @@ static _Thread_local NativeFetchResponseParts* porf_native_fetch_response_parts_
 ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #define MEM porf_mem
 #define PORF_NOINLINE __attribute__((noinline))
+// out of the common path: keeps it free of the spills a possible call would cost
+#define PORF_COLD __attribute__((noinline, cold))
 // run-once code (module init, top level): optimize for size whatever -O the unit gets
 #if defined(__clang__)
 #define PORF_ONCE __attribute__((noinline, minsize))
@@ -5031,26 +5083,171 @@ ${threads ? `#define porf_ld_bits(p) __atomic_load_n((jsbits*)(p), __ATOMIC_RELA
 #define PORF_OBJ_SHAPE(ent, size, cap) ((u64)(u32)(ent) | ((u64)(u16)(size) << 32) | ((u64)(u16)(cap) << 48))
 #define PORF_OBJ_SNAP(o, ent, size) do { const u64 porf_s_ = porf_obj_snap((u32)(o)); (ent) = (i32)(u32)porf_s_; (size) = (i32)(u16)(porf_s_ >> 32); } while (0)
 #define PORF_OBJ_SNAP3(o, ent, size, cap) do { const u64 porf_s_ = porf_obj_snap((u32)(o)); (ent) = (i32)(u32)porf_s_; (size) = (i32)(u16)(porf_s_ >> 32); (cap) = (i32)(u16)(porf_s_ >> 48); } while (0)
-${threads ? `static inline u64 porf_obj_snap(u32 o) { return __atomic_load_n((u64*)(MEM + o), __ATOMIC_ACQUIRE); }
+${threads ? `// relaxed: everything a reader then loads is reached through the entries pointer in this
+// word, so it is ordered after it (address dependency, as webkit relies on too)
+static inline u64 porf_obj_snap(u32 o) { return __atomic_load_n((u64*)(MEM + o), __ATOMIC_RELAXED); }
 static inline void porf_obj_publish(u32 o, u64 shape) { __atomic_store_n((u64*)(MEM + o), shape, __ATOMIC_RELEASE); }
 static inline void porf_obj_store_word(u32 p, u64 w) { __atomic_store_n((u64*)(MEM + p), w, __ATOMIC_RELAXED); }
-// held by every writer (see __Porffor_object_commit): a short spin, parking for collections
-// while waiting (the holder may be stopped at a safepoint while it allocates)
-static PORF_NOINLINE void porf_obj_lock_slow(u32* l) {
+// ---- thread-local objects (webkit's "transition thread locality") ----
+// objects (lock word @20), arrays (@12), map/set containers (@20) and promises (@36) start
+// out owned by the thread that allocates them: the word holds its tag, (id << 12) |
+// PORF_TTL_LOCAL. the owner reads and writes them without any locking, as without threads.
+// another thread's first write takes one over: it marks the word PORF_TTL_PENDING, queues
+// it on the owner and waits. at its next clean point the owner turns everything queued
+// into shared (0): from then on writers lock, holding (id << 12) | depth (reentrant).
+// a clean point is somewhere the thread is never midway through changing something it
+// owns: a loop back-edge in user code, a blocking wait (join, Atomics.wait, Lock, the
+// builtin lock) or waiting for another lock. until then the owner keeps using it lock-free
+// (it may be midway through an operation on it), so it accepts its tag with PENDING too.
+// readers never lock, so they need none of this
+#define PORF_TTL_LOCAL 0x800u
+#define PORF_TTL_PENDING 0x400u
+#define PORF_TTL_DEPTH 0x3ffu
+
+#if defined(__APPLE__) && defined(__aarch64__)
+// in a reserved thread-specific slot, like porf_ts (a _Thread_local read is a call on darwin)
+static inline u32 porf_self_tag(void) { return (u32)porf_tsd()[PORF_TSD_TAG]; }
+static void porf_set_self_tag(u32 tag) { porf_tsd()[PORF_TSD_TAG] = tag; }
+static void porf_ttl_init(void) {
+  porf_ts_set(&porf_main_ts);
+  porf_set_self_tag((1u << 12) | PORF_TTL_LOCAL);
+}
+#else
+static _Thread_local u32 porf_self_tag_v;
+static inline u32 porf_self_tag(void) { return porf_self_tag_v; }
+static void porf_set_self_tag(u32 tag) { porf_self_tag_v = tag; }
+static void porf_ttl_init(void) {
+  porf_ts_set(&porf_main_ts);
+  porf_set_self_tag((1u << 12) | PORF_TTL_LOCAL);
+}
+#endif
+
+// owned by this thread, so used without locking. one with a takeover pending is still the
+// owner's too, but that rare case goes the locked way, where porf_rlock_slow lets it through
+#define porf_ttl_mine(p) (__atomic_load_n((u32*)(MEM + (p)), __ATOMIC_RELAXED) == porf_self_tag())
+
+// the owner, at a clean point (holding porf_stw_lock): share everything queued on it
+static void porf_ttl_release_locked(porf_tstate* t) {
+  if (t->ttl_len == 0) return;
+  const u32 pending = t->lock_id | PORF_TTL_LOCAL | PORF_TTL_PENDING;
+  for (u32 i = 0; i < t->ttl_len; i++) {
+    u32* l = (u32*)(MEM + t->ttl_list[i]);
+    if (__atomic_load_n(l, __ATOMIC_RELAXED) == pending) __atomic_store_n(l, 0u, __ATOMIC_RELEASE);
+  }
+  __atomic_fetch_sub(&porf_ttl_pending, t->ttl_len, __ATOMIC_RELAXED);
+  t->ttl_len = 0;
+  pthread_cond_broadcast(&porf_stw_cond);
+}
+
+static PORF_COLD void porf_poll(void) {
+  if (__atomic_load_n(&porf_stw_requested, __ATOMIC_ACQUIRE)) porf_park();
+  porf_tstate* t = porf_ts;
+  if (__atomic_load_n(&t->ttl_len, __ATOMIC_RELAXED) != 0) {
+    pthread_mutex_lock(&porf_stw_lock);
+    porf_ttl_release_locked(t);
+    pthread_mutex_unlock(&porf_stw_lock);
+  }
+}
+// a clean point: collections, and handing over what other threads asked for
+#define PORF_CLEAN_POINT() do { if (__builtin_expect(__atomic_load_n(&porf_poll_req.any, __ATOMIC_RELAXED) != 0, 0)) porf_poll(); } while (0)
+
+// around a blocking wait (a clean point): while it lasts other threads take over this
+// thread's objects directly
+static void porf_ttl_clean_enter(void) {
+  porf_tstate* t = porf_ts;
+  pthread_mutex_lock(&porf_stw_lock);
+  porf_ttl_release_locked(t);
+  t->ttl_clean = 1;
+  pthread_mutex_unlock(&porf_stw_lock);
+}
+static void porf_ttl_clean_exit(void) {
+  pthread_mutex_lock(&porf_stw_lock);
+  porf_ts->ttl_clean = 0;
+  pthread_mutex_unlock(&porf_stw_lock);
+}
+
+// another thread's object, which this thread wants to write: returns once it is shared.
+// waiting is a clean point too, and counts as parked for collections
+static PORF_COLD void porf_ttl_takeover(u32 p) {
+  u32* l = (u32*)(MEM + p);
+  porf_tstate* me = porf_ts;
+  PORF_SAVE_STACK(me);
+  pthread_mutex_lock(&porf_stw_lock);
+  i32 parked = 0;
   for (;;) {
-    PORF_SAFEPOINT();
+    const u32 v = __atomic_load_n(l, __ATOMIC_ACQUIRE);
+    if (!(v & PORF_TTL_LOCAL)) break;
+    const u32 owner = v & ~0xfffu;
+    porf_tstate* t = porf_threads;
+    while (t != NULL && t->lock_id != owner) t = t->next;
+    if (t == NULL || t->ttl_clean) {
+      // the owner is gone, or waiting between operations: nothing of it is midway
+      u32 e = v;
+      __atomic_compare_exchange_n(l, &e, 0u, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+      continue;
+    }
+    if (!(v & PORF_TTL_PENDING)) {
+      u32 e = v;
+      if (!__atomic_compare_exchange_n(l, &e, v | PORF_TTL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
+      if (t->ttl_len == t->ttl_cap) {
+        t->ttl_cap = t->ttl_cap ? t->ttl_cap * 2u : 16u;
+        t->ttl_list = (u32*)realloc(t->ttl_list, (size_t)t->ttl_cap * sizeof(u32));
+        if (t->ttl_list == NULL) abort();
+      }
+      t->ttl_list[t->ttl_len++] = p;
+      __atomic_fetch_add(&porf_ttl_pending, 1u, __ATOMIC_SEQ_CST);
+    }
+    if (!parked) {
+      porf_ttl_release_locked(me);
+      me->ttl_clean = 1;
+      porf_threads_parked++;
+      parked = 1;
+      pthread_cond_broadcast(&porf_stw_cond);
+    }
+    pthread_cond_wait(&porf_stw_cond, &porf_stw_lock);
+  }
+  if (parked) {
+    me->ttl_clean = 0;
+    while (porf_stw_requested) pthread_cond_wait(&porf_stw_cond, &porf_stw_lock);
+    porf_threads_parked--;
+  }
+  pthread_mutex_unlock(&porf_stw_lock);
+}
+
+static PORF_COLD void porf_rlock_slow(u32 p, u32 me) {
+  u32* l = (u32*)(MEM + p);
+  const u32 id = me & ~0xfffu;
+  for (;;) {
+    const u32 v = __atomic_load_n(l, __ATOMIC_RELAXED);
+    if ((v & ~PORF_TTL_PENDING) == me) return; // ours, with a takeover pending: still lock-free
+    if (v & PORF_TTL_LOCAL) {
+      porf_ttl_takeover(p);
+      continue;
+    }
+    if (v != 0 && (v & ~PORF_TTL_DEPTH) == id) {
+      __atomic_store_n(l, v + 1u, __ATOMIC_RELAXED);
+      return;
+    }
     u32 z = 0;
-    if (__atomic_load_n(l, __ATOMIC_RELAXED) == 0 &&
-      __atomic_compare_exchange_n(l, &z, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    if (v == 0 && __atomic_compare_exchange_n(l, &z, id | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    PORF_CLEAN_POINT();
     sched_yield();
   }
 }
-static inline void porf_obj_lock(u32 o) {
-  u32* l = (u32*)(MEM + o + 20);
-  u32 z = 0;
-  if (__builtin_expect(!__atomic_compare_exchange_n(l, &z, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED), 0)) porf_obj_lock_slow(l);
+// a lock word at p: nothing for the owner of a thread-local one, else a reentrant lock
+static inline void porf_rlock(u32 p) {
+  if (__builtin_expect(porf_ttl_mine(p), 1)) return;
+  porf_rlock_slow(p, porf_self_tag());
 }
-static inline void porf_obj_unlock(u32 o) { __atomic_store_n((u32*)(MEM + o + 20), 0u, __ATOMIC_RELEASE); }
+static inline void porf_runlock(u32 p) {
+  u32* l = (u32*)(MEM + p);
+  const u32 v = __atomic_load_n(l, __ATOMIC_RELAXED);
+  if (v & PORF_TTL_LOCAL) return;
+  if ((v & PORF_TTL_DEPTH) == 1u) __atomic_store_n(l, 0u, __ATOMIC_RELEASE);
+    else __atomic_store_n(l, v - 1u, __ATOMIC_RELAXED);
+}
+#define porf_obj_lock(o) porf_rlock((u32)(o) + 20u)
+#define porf_obj_unlock(o) porf_runlock((u32)(o) + 20u)
 // the common write: the entry is still in the live block (no grow or delete moved it) with
 // the flags the caller decided on, so only its value word changes. 0: take the general
 // path (__Porffor_object_commit)
@@ -5064,34 +5261,16 @@ static inline int porf_obj_store_live(u32 o, u32 e, u32 hash, u32 key, u32 key_t
   porf_obj_unlock(o);
   return live;
 }
-// the common add: the shape the caller's lookup saw is still current (nothing was added or
-// removed since, so the key is still absent) and there is room, so the entry goes straight
-// into the next slot. 0: take the general path
-static inline int porf_obj_add_fast(u32 o, u64 seen, u32 hash, u32 key, u32 key_type, u32 flags, jsbits w) {
-  porf_obj_lock(o);
-  const u64 s = porf_obj_snap(o);
-  const u32 ent = (u32)s, size = (u32)(u16)(s >> 32), cap = (u32)(u16)(s >> 48);
-  if (s != seen || size >= cap || (*(u8*)(MEM + o + 16) & 1u)) {
-    porf_obj_unlock(o);
-    return 0;
-  }
-  const u32 e = ent + size * 24u;
-  *(u32*)(MEM + e) = hash;
-  *(u32*)(MEM + e + 4) = key;
-  *(u8*)(MEM + e + 18) = (u8)key_type;
-  *(u8*)(MEM + e + 16) = (u8)flags;
-  porf_st_bits(MEM + e + 8, w);
-  porf_obj_publish(o, PORF_OBJ_SHAPE(ent, size + 1u, cap));
-  porf_obj_unlock(o);
-  return 1;
-}
 ` : `static inline u64 porf_obj_snap(u32 o) { return *(u64*)(MEM + o); }
 static inline void porf_obj_publish(u32 o, u64 shape) { *(u64*)(MEM + o) = shape; }
 static inline void porf_obj_store_word(u32 p, u64 w) { *(u64*)(MEM + p) = w; }
 #define porf_obj_lock(o) ((void)0)
 #define porf_obj_unlock(o) ((void)0)
+#define porf_rlock(p) ((void)0)
+#define porf_runlock(p) ((void)0)
+#define porf_ttl_mine(p) 1
+#define porf_self_tag() 0u
 #define porf_obj_store_live(o, e, hash, key, key_type, flags, w) 0
-#define porf_obj_add_fast(o, seen, hash, key, key_type, flags, w) 0
 `}
 ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 
@@ -5108,40 +5287,16 @@ ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 #define PORF_ARR_CAP(a) (*(i32*)(MEM + (a) + 8))
 
 // with threads readers never lock. capacity never shrinks, and a grow publishes the new
-// entries before the new capacity, so a reader that loads the capacity and then the
-// entries (PORF_ARR_VIEW) always indexes inside the block it got. len may run ahead of
-// cap (length = n does not grow), so indexes are checked against both. every writer
-// holds the array's lock, which the holder may take again (a builtin keeps it across a
-// whole splice while the helpers it calls lock too)
-${threads ? `#define PORF_ARR_VIEW(a, ent, cap) do { (cap) = __atomic_load_n((u32*)(MEM + (a) + 8), __ATOMIC_ACQUIRE); (ent) = __atomic_load_n((u32*)(MEM + (a) + 4), __ATOMIC_ACQUIRE); } while (0)
-#define PORF_ARR_LEN_LOAD(a) __atomic_load_n((i32*)(MEM + (a)), __ATOMIC_ACQUIRE)
-#define PORF_ARR_LEN_STORE(a, n) __atomic_store_n((i32*)(MEM + (a)), (n), __ATOMIC_RELEASE)
-#define PORF_ARR_DEPTH 0xfffu
-// a lock word at p (arrays @12, map/set containers @20): the owner's lock_id | depth.
-// the owner may take it again; a waiter parks for collections like the object lock
-static PORF_NOINLINE void porf_rlock_slow(u32* l, u32 me) {
-  for (;;) {
-    PORF_SAFEPOINT();
-    u32 z = 0;
-    if (__atomic_load_n(l, __ATOMIC_RELAXED) == 0 &&
-      __atomic_compare_exchange_n(l, &z, me | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
-    sched_yield();
-  }
-}
-static inline void porf_rlock(u32 p) {
-  u32* l = (u32*)(MEM + p);
-  const u32 me = porf_ts->lock_id;
-  const u32 v = __atomic_load_n(l, __ATOMIC_RELAXED);
-  if ((v & ~PORF_ARR_DEPTH) == me) { __atomic_store_n(l, v + 1u, __ATOMIC_RELAXED); return; }
-  u32 z = 0;
-  if (__builtin_expect(!__atomic_compare_exchange_n(l, &z, me | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED), 0)) porf_rlock_slow(l, me);
-}
-static inline void porf_runlock(u32 p) {
-  u32* l = (u32*)(MEM + p);
-  const u32 v = __atomic_load_n(l, __ATOMIC_RELAXED);
-  if ((v & PORF_ARR_DEPTH) == 1u) __atomic_store_n(l, 0u, __ATOMIC_RELEASE);
-    else __atomic_store_n(l, v - 1u, __ATOMIC_RELAXED);
-}
+// entries before the new capacity, so a reader that loads the capacity (acquire) and then
+// the entries (PORF_ARR_VIEW) always indexes inside the block it got; the element load
+// depends on that entries pointer. len may run ahead of cap (length = n does not grow), so
+// indexes are checked against both; a racing reader may see a new len before its element
+// (a hole, the slot's initial value). writers other than the owner of a thread-local array
+// hold its lock, which the holder may take again (a builtin keeps it across a whole splice
+// while the helpers it calls lock too)
+${threads ? `#define PORF_ARR_VIEW(a, ent, cap) do { (cap) = __atomic_load_n((u32*)(MEM + (a) + 8), __ATOMIC_ACQUIRE); (ent) = __atomic_load_n((u32*)(MEM + (a) + 4), __ATOMIC_RELAXED); } while (0)
+#define PORF_ARR_LEN_LOAD(a) __atomic_load_n((i32*)(MEM + (a)), __ATOMIC_RELAXED)
+#define PORF_ARR_LEN_STORE(a, n) __atomic_store_n((i32*)(MEM + (a)), (n), __ATOMIC_RELAXED)
 #define porf_arr_lock(a) porf_rlock((u32)(a) + 12u)
 #define porf_arr_unlock(a) porf_runlock((u32)(a) + 12u)
 // clear or move whole value words, so a racing reader never sees a torn one
@@ -5153,8 +5308,6 @@ static void porf_words_move(u32 dst, u32 src, u32 n) {
 ` : `#define PORF_ARR_VIEW(a, ent, cap) do { (cap) = (u32)PORF_ARR_CAP(a); (ent) = PORF_ARR_ENT(a); } while (0)
 #define PORF_ARR_LEN_LOAD(a) PORF_ARR_LEN(a)
 #define PORF_ARR_LEN_STORE(a, n) (PORF_ARR_LEN(a) = (n))
-#define porf_rlock(p) ((void)0)
-#define porf_runlock(p) ((void)0)
 #define porf_arr_lock(a) ((void)0)
 #define porf_arr_unlock(a) ((void)0)
 #define porf_words_clear(p, n) memset(MEM + (p), 0, (size_t)(n) << 3)
@@ -5165,7 +5318,7 @@ ${st}u32 porf_arr_new(i32 len, i32 cap) {
   if (cap < len) cap = len;
   if (cap < 4) cap = 4;
   const u32 a = porf_alloc(16 + ((u32)cap << 3), ${TYPES.array});
-  PORF_ARR_LEN(a) = len; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap; *(u32*)(MEM + a + 12) = 0;
+  PORF_ARR_LEN(a) = len; PORF_ARR_ENT(a) = a + 16; PORF_ARR_CAP(a) = cap; *(u32*)(MEM + a + 12) = porf_self_tag();
   memset(MEM + PORF_ARR_ENT(a), 0, (size_t)cap << 3);
   return a;
 }
@@ -5219,12 +5372,25 @@ ${threads ? `  __atomic_store_n((u32*)(MEM + a + 4), ent, __ATOMIC_RELEASE);
   return ent;
 }
 
-${st}void porf_arr_set(PORF_ROOT u32 a, u32 i, PORF_ROOT jsval v) {
-  porf_arr_lock(a);
+// the rare paths out of line, so the common one stays small: another thread's array (lock),
+// or one that has to grow
+static PORF_COLD void porf_arr_set_slow(PORF_ROOT u32 a, u32 i, PORF_ROOT jsval v) {
+  const int locked = !porf_ttl_mine(a + 12u);
+  if (locked) porf_arr_lock(a);
   if (i >= (u32)PORF_ARR_CAP(a)) porf_arr_grow(a, (i32)i + 1);
   porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), porf_arr_pack(v));
   if (i >= (u32)PORF_ARR_LEN(a)) PORF_ARR_LEN_STORE(a, (i32)i + 1);
-  porf_arr_unlock(a);
+  if (locked) porf_arr_unlock(a);
+  if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
+}
+
+${sti}void porf_arr_set(PORF_ROOT u32 a, u32 i, PORF_ROOT jsval v) {
+  if (__builtin_expect(!porf_ttl_mine(a + 12u) || i >= (u32)PORF_ARR_CAP(a), 0)) {
+    porf_arr_set_slow(a, i, v);
+    return;
+  }
+  porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), porf_arr_pack(v));
+  if (i >= (u32)PORF_ARR_LEN(a)) PORF_ARR_LEN_STORE(a, (i32)i + 1);
   if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
 }
 ${iterClose ? `
@@ -5255,13 +5421,15 @@ static void porf_iter_unwind(void) {
 }
 ` : ''}
 ${st}void porf_arr_delete(u32 a, u32 i) {
-  porf_arr_lock(a);
+  const int locked = !porf_ttl_mine(a + 12u);
+  if (locked) porf_arr_lock(a);
   if (i < (u32)PORF_ARR_LEN(a) && i < (u32)PORF_ARR_CAP(a)) porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), 0);
-  porf_arr_unlock(a);
+  if (locked) porf_arr_unlock(a);
 }
 
 ${st}void porf_arr_set_len(u32 a, u32 new_len) {
-  porf_arr_lock(a);
+  const int locked = !porf_ttl_mine(a + 12u);
+  if (locked) porf_arr_lock(a);
   const u32 old_len = (u32)PORF_ARR_LEN(a);
   if (new_len < old_len) {
     const u32 cap = (u32)PORF_ARR_CAP(a);
@@ -5269,16 +5437,26 @@ ${st}void porf_arr_set_len(u32 a, u32 new_len) {
     if (new_len < clear) porf_words_clear(PORF_ARR_ENT(a) + (new_len << 3), clear - new_len);
   }
   PORF_ARR_LEN_STORE(a, (i32)new_len);
-  porf_arr_unlock(a);
+  if (locked) porf_arr_unlock(a);
 }
 
-${st}jsval porf_arr_push(PORF_ROOT u32 a, PORF_ROOT jsval v) {
-  porf_arr_lock(a);
+static PORF_COLD jsval porf_arr_push_slow(PORF_ROOT u32 a, PORF_ROOT jsval v) {
+  const int locked = !porf_ttl_mine(a + 12u);
+  if (locked) porf_arr_lock(a);
   const i32 len = PORF_ARR_LEN(a);
-  porf_arr_grow(a, len + 1);
+  if (len >= PORF_ARR_CAP(a)) porf_arr_grow(a, len + 1);
   porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)len << 3), porf_arr_pack(v));
   PORF_ARR_LEN_STORE(a, len + 1);
-  porf_arr_unlock(a);
+  if (locked) porf_arr_unlock(a);
+  if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
+  return porf_box_num((f64)(len + 1));
+}
+
+${sti}jsval porf_arr_push(PORF_ROOT u32 a, PORF_ROOT jsval v) {
+  const i32 len = PORF_ARR_LEN(a);
+  if (__builtin_expect(!porf_ttl_mine(a + 12u) || len >= PORF_ARR_CAP(a), 0)) return porf_arr_push_slow(a, v);
+  porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)len << 3), porf_arr_pack(v));
+  PORF_ARR_LEN_STORE(a, len + 1);
   if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
   return porf_box_num((f64)(len + 1));
 }
@@ -5367,6 +5545,7 @@ static i32 porf_atomic_wait(u32 addr, i32 size, u64 expected, f64 timeout_ms) {
     deadline.tv_sec += (time_t)(timeout_ms / 1000.0) + (time_t)(ns / 1e9);
     deadline.tv_nsec = (long)fmod(ns, 1e9);
   }
+  porf_ttl_clean_enter();
   porf_blocking_enter();
   pthread_mutex_lock(&porf_wait_lock);
   // the value check and the enqueue are one step against notify, so no wakeup is lost
@@ -5388,6 +5567,7 @@ static i32 porf_atomic_wait(u32 addr, i32 size, u64 expected, f64 timeout_ms) {
   }
   pthread_mutex_unlock(&porf_wait_lock);
   porf_blocking_exit();
+  porf_ttl_clean_exit();
   pthread_cond_destroy(&w.cond);
   return res;
 }
@@ -5759,7 +5939,7 @@ static jsval porf_promise_pending(void) {
   *(u8*)(MEM + p + PORF_PROMISE_STATE) = 0;
   *(u8*)(MEM + p + PORF_PROMISE_FLAGS) = 0;
   *(u8*)(MEM + p + PORF_PROMISE_HANDLED) = 0;
-  *(u32*)(MEM + p + PORF_PROMISE_LOCK) = 0;
+  *(u32*)(MEM + p + PORF_PROMISE_LOCK) = porf_self_tag();
   return porf_box((f64)p, ${TYPES.promise});
 }
 

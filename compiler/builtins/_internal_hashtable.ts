@@ -198,7 +198,8 @@ export const __Porffor_hashtableTombstone = (container: any, key: any, index: an
 
 export const __Porffor_hashtableNew = (withVals: boolean): any => {
   const out: any = Porffor.malloc(24);
-  Porffor.IR.storeI32(out, 20, 0);
+  const outRaw: i32 = Porffor.IR.ptr(out);
+  Porffor.c`*(u32*)(MEM + (u32)outRaw + 20u) = porf_self_tag();`;
 
   const keys: any[] = Porffor.array.new(4);
   Porffor.IR.storeI32(out, 0, keys);

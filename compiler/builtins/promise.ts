@@ -243,7 +243,8 @@ export const __Porffor_promise_create = (): Promise => {
   Porffor.IR.storeJv(obj, 24, undefined);
   Porffor.IR.storeU8(obj, 32, 0);
   Porffor.IR.storeU8(obj, 34, 0);
-  Porffor.IR.storeI32(obj, 36, 0);
+  const objRaw: i32 = Porffor.IR.ptr(obj);
+  Porffor.c`*(u32*)(MEM + (u32)objRaw + 36u) = porf_self_tag();`;
   return obj;
 };
 
