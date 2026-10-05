@@ -5079,7 +5079,9 @@ ${threads ? `// stores are release: a value may point at something just built (a
 // a string's chars), which must be visible before the pointer. a load is ordered before
 // what it is used to reach by that address dependency (as webkit relies on); tsan does not
 // model those, so under it they are acquire
-#if defined(__has_feature)
+#if defined(__SANITIZE_THREAD__)
+#define PORF_DEP_ORDER __ATOMIC_ACQUIRE
+#elif defined(__has_feature)
 #if __has_feature(thread_sanitizer)
 #define PORF_DEP_ORDER __ATOMIC_ACQUIRE
 #endif
