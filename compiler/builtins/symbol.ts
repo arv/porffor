@@ -64,11 +64,12 @@ export const __Symbol_prototype_valueOf = function (this: Symbol) {
 };
 
 const forStore: Map = new Map();
-// the registry is shared by every thread
+// the registry is shared by every thread: holding its lock makes the lookup and the insert
+// one step (the lock is reentrant, so forStore's own methods take it again inside)
 export const __Symbol_for = (key: any): Symbol => {
   key = ecma262.ToString(key);
 
-  Porffor.c`porf_builtin_lock();`;
+  __Porffor_rlock(Porffor.IR.ptr(forStore) + 20);
   let out: Symbol;
   if (forStore.has(key)) {
     out = forStore.get(key);
@@ -76,7 +77,7 @@ export const __Symbol_for = (key: any): Symbol => {
     out = Symbol(key);
     forStore.set(key, out);
   }
-  Porffor.c`porf_builtin_unlock();`;
+  __Porffor_runlock(Porffor.IR.ptr(forStore) + 20);
 
   return out;
 };
@@ -87,9 +88,7 @@ export const __Symbol_keyFor = (arg: any): any => {
   const sym: Symbol = arg;
   const desc: any = sym.description;
 
-  Porffor.c`porf_builtin_lock();`;
   const stored: Symbol = forStore.get(desc);
-  Porffor.c`porf_builtin_unlock();`;
   if (sym == stored) return desc;
 
   return undefined;

@@ -4513,7 +4513,7 @@ static void porf_gc_lock_release(void) {
   if (--porf_ts->gc_lock_depth == 0) pthread_mutex_unlock(&porf_gc_lock);
 }
 
-// guards builtin tables every thread shares (symbol registry, hidden props). reentrant,
+// guards builtin tables every thread shares (hidden props). reentrant,
 // and a waiter counts as parked like with the gc lock
 static pthread_mutex_t porf_builtin_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void porf_ttl_clean_enter(void);
