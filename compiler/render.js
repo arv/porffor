@@ -390,7 +390,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
       entryLocalGlobals.add(g.name);
     }
   }
-  const globalAssign = (name, value) => packedGlobal(name) ? `porf_st_bits(&${sanitize(name)}, porf_pack(${value}))` : `${gname(name)} = ${value}`;
+  const globalAssign = (name, value) => packedGlobal(name) ? `porf_st_val(&${sanitize(name)}, ${value})` : `${gname(name)} = ${value}`;
   // per-thread stand-ins for builtin static array literals: data segment id -> capacity
   const scratchArrs = new Map();
   const promiseResolveFunc = funcByName.get('__Porffor_promise_resolve');
@@ -759,7 +759,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
         if (unaligned) {
           const un = { i16: 'u16', i32: 'u32', i64: 'u64', jsval: 'u64' }[ctype] ?? ctype;
           emit(`${ind()}porf_store_un_${un}(${addr}, ${ctype === 'jsval' ? packArg(value) : rx(value, P_COMMA)});\n`);
-        } else if (ctype === 'jsval') emit(`${ind()}porf_st_bits(${addr}, ${packArg(value)});\n`);
+        } else if (ctype === 'jsval') emit(`${ind()}porf_st_val(${addr}, ${jsArg(value)});\n`);
           else emit(`${ind()}*(${ctype === 'i8' ? 'int8_t' : ctype === 'i16' ? 'int16_t' : ctype}*)(${addr}) = ${rx(value, P_COMMA)};\n`);
         return;
       }
@@ -1626,8 +1626,11 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     if (off < size * 24 && porf_ttl_mine(o + 20u)) {
       const u32 e = (u32)ent + (u32)off;
       if (*(u32*)(MEM + e + 4u) == (u32)key.val && (*(u8*)(MEM + e + 16u) & 0x9u) == 0x8u) {
-        porf_st_bits(MEM + e + 8u, porf_pack(v));
-        if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(o, ${TYPES.object});
+${usesThreads ? `        if (porf_val_points(v.type)) {
+          porf_st_bits(MEM + e + 8u, porf_pack(v));
+          if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(o, ${TYPES.object});
+        } else porf_st_val_bits(MEM + e + 8u, v.type, porf_pack(v));` : `        porf_st_bits(MEM + e + 8u, porf_pack(v));
+        if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(o, ${TYPES.object});`}
         return v;
       }
     }
@@ -5238,10 +5241,21 @@ ${threads ? `// stores are release: a value may point at something just built (a
 #define PORF_ST_RLX(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
 #endif
 #define porf_ld_bits(p) PORF_LD_DEP((jsbits*)(p))
-#define porf_st_bits(p, b) __atomic_store_n((jsbits*)(p), (b), __ATOMIC_RELEASE)` : `#define PORF_LD_RLX(p) (*(p))
+#define porf_st_bits(p, b) __atomic_store_n((jsbits*)(p), (b), __ATOMIC_RELEASE)
+// a JS value's store: release when the value may point at memory (an object, a string...) that
+// may be just built, so must be visible first. numbers, booleans, undefined and Number and
+// Boolean objects (their primitive, retyped) point at nothing, so theirs need no order:
+// relaxed (on arm64 a str, not an stlr). the same values porf_gc_type_can_reference rejects,
+// so the stores below share one test with their write barrier
+static inline int porf_val_points(i32 type) { return type != ${TYPES.undefined} && type != ${TYPES.number} && type != ${TYPES.boolean} && type != ${TYPES.numberobject} && type != ${TYPES.booleanobject}; }
+static inline void porf_st_val_bits(void* p, i32 type, jsbits b) { if (porf_val_points(type)) porf_st_bits(p, b); else PORF_ST_RLX((jsbits*)p, b); }
+static inline void porf_st_val(void* p, jsval v) { porf_st_val_bits(p, v.type, porf_pack(v)); }` : `#define PORF_LD_RLX(p) (*(p))
 #define PORF_LD_DEP(p) (*(p))
 #define porf_ld_bits(p) (*(jsbits*)(p))
-#define porf_st_bits(p, b) (*(jsbits*)(p) = (b))`}
+#define porf_st_bits(p, b) (*(jsbits*)(p) = (b))
+#define porf_st_val_bits(p, type, b) porf_st_bits((p), (b))
+#define porf_st_val(p, v) porf_st_bits((p), porf_pack(v))
+static inline int porf_val_points(i32 type) { (void)type; return 1; }`}
 
 #define PORF_OBJ_HDR 24u
 #define PORF_THREADED ${threads ? 1 : 0}
@@ -5459,7 +5473,7 @@ ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 // every other writer out, so none of the per-element protocol of porf_arr_get/set. i must be
 // in range. stores still publish with release, for lock-free readers (iteration)
 #define porf_arr_raw_get(a, i) porf_unpack(porf_ld_bits(MEM + PORF_ARR_ENT(a) + ((u64)(u32)(i) << 3)))
-#define porf_arr_raw_set(a, i, v) do { const jsval porf_rv_ = (v); porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)(u32)(i) << 3), porf_pack(porf_rv_)); if (porf_gc_type_can_reference(porf_rv_.type)) porf_gc_barrier((u32)(a), ${TYPES.array}); } while (0)
+#define porf_arr_raw_set(a, i, v) do { const jsval porf_rv_ = (v); if (porf_val_points(porf_rv_.type)) { porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)(u32)(i) << 3), porf_pack(porf_rv_)); if (porf_gc_type_can_reference(porf_rv_.type)) porf_gc_barrier((u32)(a), ${TYPES.array}); } else porf_st_val(MEM + PORF_ARR_ENT(a) + ((u64)(u32)(i) << 3), porf_rv_); } while (0)
 #define PORF_ARR_CAP(a) (*(i32*)(MEM + (a) + 8))
 
 // with threads readers never lock. capacity never shrinks, and a grow publishes the new
@@ -5554,7 +5568,7 @@ static PORF_COLD void porf_arr_set_slow(PORF_ROOT u32 a, u32 i, PORF_ROOT jsval 
   const int locked = !porf_ttl_mine(a + 12u);
   if (locked) porf_arr_lock(a);
   if (i >= (u32)PORF_ARR_CAP(a)) porf_arr_grow(a, (i32)i + 1);
-  porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), porf_arr_pack(v));
+  porf_st_val_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), v.type, porf_arr_pack(v));
   if (i >= (u32)PORF_ARR_LEN(a)) PORF_ARR_LEN_STORE(a, (i32)i + 1);
   if (locked) porf_arr_unlock(a);
   if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
@@ -5565,9 +5579,14 @@ ${sti}void porf_arr_set(PORF_ROOT u32 a, u32 i, PORF_ROOT jsval v) {
     porf_arr_set_slow(a, i, v);
     return;
   }
-  porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), porf_arr_pack(v));
+${threads ? `  // one test for the store's order and the barrier (no collection can come between them)
+  if (porf_val_points(v.type)) {
+    porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), porf_arr_pack(v));
+    if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
+  } else porf_st_val_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), v.type, porf_arr_pack(v));
+  if (i >= (u32)PORF_ARR_LEN(a)) PORF_ARR_LEN_STORE(a, (i32)i + 1);` : `  porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)i << 3), porf_arr_pack(v));
   if (i >= (u32)PORF_ARR_LEN(a)) PORF_ARR_LEN_STORE(a, (i32)i + 1);
-  if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
+  if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});`}
 }
 ${iterClose ? `
 ${st}void porf_iter_link(PORF_ROOT jsval rec) {
@@ -5621,7 +5640,7 @@ static PORF_COLD jsval porf_arr_push_slow(PORF_ROOT u32 a, PORF_ROOT jsval v) {
   if (locked) porf_arr_lock(a);
   const i32 len = PORF_ARR_LEN(a);
   if (len >= PORF_ARR_CAP(a)) porf_arr_grow(a, len + 1);
-  porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)len << 3), porf_arr_pack(v));
+  porf_st_val_bits(MEM + PORF_ARR_ENT(a) + ((u64)len << 3), v.type, porf_arr_pack(v));
   PORF_ARR_LEN_STORE(a, len + 1);
   if (locked) porf_arr_unlock(a);
   if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
@@ -5631,9 +5650,13 @@ static PORF_COLD jsval porf_arr_push_slow(PORF_ROOT u32 a, PORF_ROOT jsval v) {
 ${sti}jsval porf_arr_push(PORF_ROOT u32 a, PORF_ROOT jsval v) {
   const i32 len = PORF_ARR_LEN(a);
   if (__builtin_expect(!porf_ttl_mine(a + 12u) || len >= PORF_ARR_CAP(a), 0)) return porf_arr_push_slow(a, v);
-  porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)len << 3), porf_arr_pack(v));
+${threads ? `  if (porf_val_points(v.type)) {
+    porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)len << 3), porf_arr_pack(v));
+    if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
+  } else porf_st_val_bits(MEM + PORF_ARR_ENT(a) + ((u64)len << 3), v.type, porf_arr_pack(v));
+  PORF_ARR_LEN_STORE(a, len + 1);` : `  porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)len << 3), porf_arr_pack(v));
   PORF_ARR_LEN_STORE(a, len + 1);
-  if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});
+  if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(a, ${TYPES.array});`}
   return porf_box_num((f64)(len + 1));
 }
 
