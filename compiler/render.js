@@ -116,7 +116,8 @@ const cReservedNames = new Set([
 
 // inlining these has little perf benefit and significantly increases binary size
 const NEVER_INLINE = new Set([
-  '__Porffor_object_get_ic', '__Porffor_object_get_icMiss', '__Porffor_object_get_withHash'
+  '__Porffor_object_get_ic', '__Porffor_object_get_icMiss', '__Porffor_object_get_withHash',
+  '__Porffor_object_set_icMiss', '__Porffor_object_setStrict_icMiss'
 ]);
 
 const sanitizeMemo = new Map();
@@ -1588,6 +1589,51 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
   if (!split) {
     for (const f of linkFuncs) link.push(proto(f));
     link.push(...linkProtos);
+
+    // a read IC hit inline at the site (see genericMemberGet in codegen): the entry the site
+    // last found, at its byte offset in the entries block, still with the same hash and still
+    // a data property. anything else is the out-of-line miss, which looks the key up and
+    // fills the site
+    const icMissFunc = funcByName.get('__Porffor_object_get_icMiss');
+    if (icMissFunc?.body) link.push(`static inline jsval porf_ic_get(PORF_ROOT jsval obj, PORF_ROOT jsval key, i32 hash, i32 slot) {
+  if (porf_jv_type(obj) == ${TYPES.object} && (u32)obj.val != 0u) {
+    const i32 off = PORF_LD_RLX((i32*)(MEM + (u32)slot));
+    i32 ent, size;
+    PORF_OBJ_SNAP((u32)obj.val, ent, size);
+    if (off < size * 24) {
+      const u32 e = (u32)ent + (u32)off;
+      if (*(i32*)(MEM + e) == hash && (*(u16*)(MEM + e + 16u) & 1u) == 0u) return porf_unpack(porf_ld_bits(MEM + e + 8u));
+    }
+  }
+  return ${fnSym(icMissFunc)}(obj, key, hash, slot);
+}
+`);
+
+    // a write IC hit inline at the site (see genericMemberSet in codegen): the site's entry,
+    // still with the same hash and still a writable data property, of an object this thread
+    // owns (always, without threads: nothing else can move its entries), written in place.
+    // anything else is the out-of-line miss: the ordinary set, then filling the site
+    for (const [ name, miss ] of [ [ 'porf_ic_set', '__Porffor_object_set_icMiss' ], [ 'porf_ic_set_strict', '__Porffor_object_setStrict_icMiss' ] ]) {
+      const missFunc = funcByName.get(miss);
+      if (missFunc?.body) link.push(`static inline jsval ${name}(PORF_ROOT jsval obj, PORF_ROOT jsval key, PORF_ROOT jsval v, i32 hash, i32 slot) {
+  if (porf_jv_type(obj) == ${TYPES.object} && (u32)obj.val != 0u) {
+    const u32 o = (u32)obj.val;
+    const i32 off = PORF_LD_RLX((i32*)(MEM + (u32)slot));
+    i32 ent, size;
+    PORF_OBJ_SNAP(o, ent, size);
+    if (off < size * 24 && porf_ttl_mine(o + 20u)) {
+      const u32 e = (u32)ent + (u32)off;
+      if (*(i32*)(MEM + e) == hash && (*(u8*)(MEM + e + 16u) & 0x9u) == 0x8u) {
+        porf_st_bits(MEM + e + 8u, porf_pack(v));
+        if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(o, ${TYPES.object});
+        return v;
+      }
+    }
+  }
+  return ${fnSym(missFunc)}(obj, key, v, hash, slot);
+}
+`);
+    }
   }
 
   // module globals (top-level JS bindings)

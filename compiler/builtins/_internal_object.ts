@@ -795,6 +795,37 @@ export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot
   return __Porffor_object_get_withHash(_obj, key, hash);
 };
 
+// a write IC miss (see porf_ic_set in render.js): the ordinary set, then the site's slot for
+// the entry when it is an own writable data property. first writer wins, as for reads
+export const __Porffor_object_set_icMiss = (obj: any, key: any, value: any, hash: i32, slot: i32): any => {
+  __Porffor_object_set_withHash(obj, key, value, hash);
+  __Porffor_object_icFillWrite(obj, hash, slot);
+  return value;
+};
+
+export const __Porffor_object_setStrict_icMiss = (obj: any, key: any, value: any, hash: i32, slot: i32): any => {
+  __Porffor_object_setStrict_withHash(obj, key, value, hash);
+  __Porffor_object_icFillWrite(obj, hash, slot);
+  return value;
+};
+
+export const __Porffor_object_icFillWrite = (obj: any, hash: i32, slot: i32): void => {
+  if (Porffor.type(obj) != Porffor.TYPES.object) return;
+  const o: i32 = Porffor.IR.ptr(obj);
+  if (o == 0) return;
+  let entriesPtr: i32 = 0;
+  let size: i32 = 0;
+  Porffor.c`PORF_OBJ_SNAP(o, entriesPtr, size);`;
+  let ptr: i32 = entriesPtr;
+  const endPtr: i32 = ptr + size * 24;
+  for (; ptr < endPtr; ptr += 24) {
+    if (Porffor.IR.loadI32(ptr, 0) == hash) {
+      if ((Porffor.IR.loadU8(ptr, 16) & 0b1001) == 0b1000) Porffor.c`{ i32 porf_ic_free_ = 2147483647; __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(ptr - entriesPtr), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); }`;
+      return;
+    }
+  }
+};
+
 export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): any => {
   let obj: any = _obj;
   const trueType: i32 = Porffor.type(obj);

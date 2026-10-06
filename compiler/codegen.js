@@ -3054,6 +3054,12 @@ const generateAssign = (scope, decl, valueUnused = false) => {
         : performOp(scope, op,
             hash != null ? builtinCall(scope, '__Porffor_object_get_withHash', [ obj, key, Const(T.i32, hash) ]) : builtinCall(scope, '__Porffor_object_get', [ obj, key ]),
             generate(scope, decl.right), null, getNodeType(scope, decl.right));
+      // the write IC: the hit inline (porf_ic_set in render.js), the miss a call
+      if (hash != null && Prefs.ic && !Prefs.split && (objectKnown == null || objectKnown === TYPES.object)) {
+        includeBuiltin(scope, setBuiltin + '_icMiss');
+        return Call(setBuiltin === '__Porffor_object_setStrict' ? 'porf_ic_set_strict' : 'porf_ic_set', [ coerceValue(obj, T.jsval), key, coerceValue(value, T.jsval), Const(T.i32, hash), icSlot(scope) ], T.jsval);
+      }
+
       return hash != null
         ? builtinCall(scope, setBuiltin + '_withHash', [ obj, key, value, Const(T.i32, hash) ])
         : builtinCall(scope, setBuiltin, [ obj, key, value ]);
@@ -4187,6 +4193,19 @@ const resolveMemberDemands = scope => {
 
 let icSites;
 
+// an inline cache slot for one property access site: an i32 (the byte offset in an object's
+// entries block where the site last found its key), in chunks of 256 per unit
+const icSlot = scope => {
+  const unit = unitOf(scope);
+  const ic = icSites[unit] ??= { site: 0, chunk: null };
+  const index = ic.site++ % 256;
+  if (index === 0)
+    ic.chunk = dataSeg(unit, `#ic:${unit}:${ic.site}`, new Array(256).fill(i32Bytes(0x7fffffff)).flat());
+
+  const chunk = DataRef(ic.chunk);
+  return index === 0 ? chunk : Bin('+', T.i32, chunk, Const(T.i32, index * 4));
+};
+
 const generateMember = (scope, decl, objValue = null) => {
   if (!globalThis.precompile) demandMemberRead(decl);
   // builtins unless reassigned via globalThis
@@ -4257,15 +4276,11 @@ const generateMember = (scope, decl, objValue = null) => {
     if (hash == null) return builtinCall(scope, '__Porffor_object_get', [ obj, key ]);
 
     if (Prefs.ic && (known == null || known === TYPES.object)) {
-      const unit = unitOf(scope);
-      const ic = icSites[unit] ??= { site: 0, chunk: null };
-      const index = ic.site++ % 256;
-      if (index === 0)
-        ic.chunk = dataSeg(unit, `#ic:${unit}:${ic.site}`, new Array(256).fill(i32Bytes(0x7fffffff)).flat());
-
-      const chunk = DataRef(ic.chunk);
-      const slot = index === 0 ? chunk : Bin('+', T.i32, chunk, Const(T.i32, index * 4));
-      return builtinCall(scope, '__Porffor_object_get_ic', [ obj, key, Const(T.i32, hash), slot ]);
+      const slot = icSlot(scope);
+      // the hit inline (porf_ic_get in render.js), the miss a call. multi-unit builds call get_ic
+      if (Prefs.split) return builtinCall(scope, '__Porffor_object_get_ic', [ obj, key, Const(T.i32, hash), slot ]);
+      includeBuiltin(scope, '__Porffor_object_get_icMiss');
+      return Call('porf_ic_get', [ coerceValue(obj, T.jsval), key, Const(T.i32, hash), slot ], T.jsval);
     }
 
     return builtinCall(scope, '__Porffor_object_get_withHash', [ obj, key, Const(T.i32, hash) ]);
