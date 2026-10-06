@@ -5221,11 +5221,17 @@ ${threads ? `// stores are release: a value may point at something just built (a
 // __atomic builtin like a call when deciding what to inline, which cost threaded builds much
 // of their inlining (Map get stopped inlining: +37% on a Map loop); a volatile load is the
 // same single load (aligned, at most a word, never torn or repeated) and sizes as one. clang
-// sizes atomics fine, wasm needs real atomics to never tear, and tsan needs to see them
+// sizes atomics fine, and tsan needs to see them. wasm has only sequentially consistent
+// atomics, each also checked for alignment, but there an aligned plain access of at most 4
+// bytes never tears (only wider ones may), so those are plain and 8 byte ones stay atomic
 #if defined(__GNUC__) && !defined(__clang__) && !defined(PORF_TSAN)
 #define PORF_LD_RLX(p) (*(volatile __typeof__(*(p))*)(p))
 #define PORF_LD_DEP(p) (*(volatile __typeof__(*(p))*)(p))
 #define PORF_ST_RLX(p, v) (*(volatile __typeof__(*(p))*)(p) = (v))
+#elif defined(__wasm__) && !defined(PORF_TSAN)
+#define PORF_LD_RLX(p) (sizeof(*(p)) <= 4 ? *(volatile __typeof__(*(p))*)(p) : __atomic_load_n((p), __ATOMIC_RELAXED))
+#define PORF_LD_DEP(p) PORF_LD_RLX(p)
+#define PORF_ST_RLX(p, v) (sizeof(*(p)) <= 4 ? (void)(*(volatile __typeof__(*(p))*)(p) = (v)) : __atomic_store_n((p), (v), __ATOMIC_RELAXED))
 #else
 #define PORF_LD_RLX(p) __atomic_load_n((p), __ATOMIC_RELAXED)
 #define PORF_LD_DEP(p) __atomic_load_n((p), PORF_DEP_ORDER)

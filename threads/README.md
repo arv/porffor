@@ -90,8 +90,10 @@ caches, DataView scratch, and builtin array literals. The few tables every threa
   conservatively, like the main thread's.
 - A thread blocked in a wait counts as parked, so it never holds up a collection.
 
-**Wasm**: the same C builds for `wasm32-wasip1-threads` (wasi-sdk/clang). There the loads and
-stores above stay real atomics, so they never tear.
+**Wasm**: the same C builds for `wasm32-wasip1-threads` (wasi-sdk/clang). There the 8-byte
+loads and stores above stay real atomics, so they never tear. Narrower relaxed ones are plain:
+Wasm never tears an aligned access of at most 4 bytes, and its only atomics are sequentially
+consistent and checked for alignment.
 
 ## Cost
 
@@ -116,8 +118,8 @@ check off the slow path and nearly free. What remains:
 - **object_get** reads one property in a tight loop. A plain build may keep the loaded value
   in a register across iterations; a threaded build must load it again each time, since
   another thread may write it.
-- **Wasm** has only sequentially consistent atomics, so every racing load (a cache hit's three,
-  an array element) is a full atomic access.
+- **Wasm** keeps its 8-byte accesses atomic: an object's header word, every value (a cache
+  hit's two loads, an array element) and the clean points' poll.
 
 ## Testing
 
