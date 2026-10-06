@@ -29,11 +29,6 @@ const tsanBenign = {
   'race-object-memory-safety': 'a property\'s attribute byte, read without the lock while a writer commits'
 };
 
-// known failures under --stress (skipped: they can hang)
-const stressKnown = {
-  'ttl-handover': 'Maps lose entries under forced collections (a gc bug, not a threads one; fails the same without these changes)'
-};
-
 // porf_alloc forces a minor collection every N allocations, except inside one it caused
 const stress = (c, n) => {
   const reps = [
@@ -62,13 +57,8 @@ if (tests.length === 0) {
 
 const tmp = fs.mkdtempSync(join(os.tmpdir(), 'porf-threads-'));
 const small = stressEvery > 0 || tsan;
-let failed = 0, skipped = 0;
+let failed = 0;
 for (const name of tests) {
-  if (stressEvery > 0 && stressKnown[name]) {
-    console.log(`skip ${name}: ${stressKnown[name]}`);
-    skipped++;
-    continue;
-  }
   const t0 = performance.now();
   const js = join(tmp, `${name}.js`), c = join(tmp, `${name}.c`), bin = join(tmp, name);
   let src = fs.readFileSync(join(testsDir, `${name}.js`), 'utf8');
@@ -113,5 +103,5 @@ for (const name of tests) {
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log(`${tests.length - skipped - failed}/${tests.length - skipped} passed${skipped ? ` (${skipped} skipped)` : ''}${stressEvery ? `, gc stress every ${stressEvery}` : ''}${tsan ? ', tsan' : ''}`);
+console.log(`${tests.length - failed}/${tests.length} passed${stressEvery ? `, gc stress every ${stressEvery}` : ''}${tsan ? ', tsan' : ''}`);
 process.exit(failed ? 1 : 0);
