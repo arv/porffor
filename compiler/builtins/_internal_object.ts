@@ -792,8 +792,32 @@ export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot
   if (Porffor.type(_obj) == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(_obj) != 0) {
       const o: i32 = Porffor.IR.ptr(_obj);
+
+      // a site that found key on its receivers' prototype (a method, say): that prototype is
+      // still this receiver's, still has key as data at the same place, and the receiver has
+      // no own entry for it. every hit checks all of that, so a torn slot only misses
+      let holder: i32 = 0;
+      Porffor.c`holder = (i32)PORF_LD_RLX((u32*)(MEM + (u32)slot + 4u));`;
+      if (holder != 0) {
+        let proto: any = __Porffor_object_getPrototype(_obj);
+        if (Porffor.type(proto) == Porffor.TYPES.undefined) proto = __Object_prototype;
+        if (Porffor.fastAnd(Porffor.type(proto) == Porffor.TYPES.object, Porffor.IR.ptr(proto) == holder)) {
+          let off: i32 = 0;
+          let hEnt: i32 = 0;
+          let hSize: i32 = 0;
+          Porffor.c`off = PORF_LD_RLX((i32*)(MEM + (u32)slot));
+PORF_OBJ_SNAP((u32)holder, hEnt, hSize);`;
+          if (off < hSize * 24) {
+            const e: i32 = hEnt + off;
+            if (Porffor.fastAnd(Porffor.IR.loadI32(e, 4) == Porffor.IR.ptr(key), (Porffor.IR.loadU16(e, 16) & 0b0001) == 0)) {
+              if (!__Porffor_object_hasHash(_obj, hash)) return __Porffor_object_readValue(e);
+            }
+          }
+        }
+      }
+
       const ptr: i32 = __Porffor_object_lookup(_obj, key, hash);
-      if (ptr == 0) return __Porffor_object_getInherited(_obj, _obj, key, hash, Porffor.TYPES.object);
+      if (ptr == 0) return __Porffor_object_getInheritedIC(_obj, key, hash, slot);
       // first writer wins so polymorphic sites miss instead of storing each time. only an
       // entry keyed by this site's own key string: hits compare key pointers
       if (Porffor.IR.loadI32(ptr, 4) == Porffor.IR.ptr(key)) {
@@ -851,6 +875,42 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
   if (Porffor.type(obj) == Porffor.TYPES.object) entryPtr = __Porffor_object_lookup(obj, key, hash);
   if (entryPtr == 0) return __Porffor_object_getInherited(_obj, obj, key, hash, trueType);
   return __Porffor_object_readEntry(_obj, entryPtr);
+};
+
+// whether obj (a plain object) has an own entry with this hash: one with this key, or (rarely)
+// another key whose hash collides
+export const __Porffor_object_hasHash = (obj: any, hash: i32): boolean => {
+  const o: i32 = Porffor.IR.ptr(obj);
+  let ptr: i32 = 0;
+  let size: i32 = 0;
+  Porffor.c`PORF_OBJ_SNAP(o, ptr, size);`;
+  const endPtr: i32 = ptr + size * 24;
+  for (; ptr < endPtr; ptr += 24) {
+    if (Porffor.IR.loadI32(ptr, 0) == hash) return true;
+  }
+  return false;
+};
+
+// the rest of a read IC miss when the receiver _obj (a plain object) has no own entry for key:
+// its prototype chain. when key is a data entry of the first prototype, keyed by the site's own
+// key string, the site's slot remembers that prototype and where in it (see get_icMiss)
+export const __Porffor_object_getInheritedIC = (_obj: any, key: any, hash: i32, slot: i32): any => {
+  let proto: any = __Porffor_object_getPrototype(_obj);
+  if (Porffor.type(proto) == Porffor.TYPES.undefined) proto = __Object_prototype;
+  if (Porffor.type(proto) == Porffor.TYPES.object) if (Porffor.IR.ptr(proto) != 0) {
+    const e: i32 = __Porffor_object_lookup(proto, key, hash);
+    if (e != 0) {
+      if (Porffor.fastAnd(Porffor.IR.loadI32(e, 4) == Porffor.IR.ptr(key), (Porffor.IR.loadU16(e, 16) & 0b0001) == 0)) {
+        const p: i32 = Porffor.IR.ptr(proto);
+        let pEnt: i32 = 0;
+        let pSize: i32 = 0;
+        Porffor.c`PORF_OBJ_SNAP((u32)p, pEnt, pSize);
+{ i32 porf_ic_free_ = 2147483647; if (__atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(e - pEnt), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) __atomic_store_n((u32*)(MEM + (u32)slot + 4u), (u32)p, __ATOMIC_RELAXED); }`;
+      }
+      return __Porffor_object_readEntry(_obj, e);
+    }
+  }
+  return __Porffor_object_getInherited(_obj, _obj, key, hash, Porffor.TYPES.object);
 };
 
 // the rest of a get when obj (the receiver _obj, or its underlying object) has no own entry

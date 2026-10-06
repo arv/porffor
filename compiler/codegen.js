@@ -4193,17 +4193,18 @@ const resolveMemberDemands = scope => {
 
 let icSites;
 
-// an inline cache slot for one property access site: an i32 (the byte offset in an object's
-// entries block where the site last found its key), in chunks of 256 per unit
+// an inline cache slot for one property access site, in chunks of 256 per unit: the byte
+// offset in an entries block where the site last found its key (i32), and for a read site
+// that found it on its receivers' prototype, that prototype (u32, 0 for own properties)
 const icSlot = scope => {
   const unit = unitOf(scope);
   const ic = icSites[unit] ??= { site: 0, chunk: null };
   const index = ic.site++ % 256;
   if (index === 0)
-    ic.chunk = dataSeg(unit, `#ic:${unit}:${ic.site}`, new Array(256).fill(i32Bytes(0x7fffffff)).flat());
+    ic.chunk = dataSeg(unit, `#ic:${unit}:${ic.site}`, new Array(256).fill([ ...i32Bytes(0x7fffffff), 0, 0, 0, 0 ]).flat());
 
   const chunk = DataRef(ic.chunk);
-  return index === 0 ? chunk : Bin('+', T.i32, chunk, Const(T.i32, index * 4));
+  return index === 0 ? chunk : Bin('+', T.i32, chunk, Const(T.i32, index * 8));
 };
 
 const generateMember = (scope, decl, objValue = null) => {
