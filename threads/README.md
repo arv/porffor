@@ -102,16 +102,17 @@ all on Apple silicon; Wasm built with wasi-sdk's clang and run on node's V8):
 
 | | richards | linked_list | micro_map | object_get | micro_arr | micro_loop |
 |---|---|---|---|---|---|---|
-| macOS, clang | +2.8% | +2.6% | +4.7% | 0% | 0% | 0% |
-| Linux, gcc | +1.3% | +2.7% | +16% | +15% | -15% | -1% |
+| macOS, clang | +2.6% | +2.6% | +1.3% | 0% | 0% | 0% |
+| Linux, gcc | +1.8% | +2.7% | +5.4% | +15% | -15% | -1% |
 | Wasm, V8 | +2.5% | +7.0% | 0% | +11.5% | +12.4% | +1.5% |
 
 Property reads and writes go through inline caches (`porf_ic_get`/`porf_ic_set` in render.js):
 each site remembers where it last found its key, and a hit is a few inline instructions. A
 write hit also checks that this thread owns the object, which is what keeps the ownership
 check off the slow path and nearly free. What remains:
-- **Map/Set** take their container's lock word for every operation (micro_map). Under gcc,
-  several small threaded costs together push `Map` methods over its inlining limits.
+- **Map/Set** take their container's lock word for every operation (micro_map); inside, the
+  values are plain words under that lock. Under gcc, the lock code still costs a little
+  inlining.
 - **object_get** reads one property in a tight loop. A plain build may keep the loaded value
   in a register across iterations; a threaded build must load it again each time, since
   another thread may write it.
