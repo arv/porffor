@@ -1597,7 +1597,34 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     // a data property. anything else is the out-of-line miss, which looks the key up and
     // fills the site
     const icMissFunc = funcByName.get('__Porffor_object_get_icMiss');
-    if (icMissFunc?.body) link.push(`static inline __attribute__((always_inline)) jsval porf_ic_get(PORF_ROOT jsval obj, PORF_ROOT jsval key, i32 hash, i32 slot) {
+    // the rest of a read, out of line but lean: a site that found its key on its receivers'
+    // prototype (a method, say) keeps that prototype at slot + 4 (see getInheritedIC). a hit:
+    // the receiver's prototype is still it, it still has the key as data at the site's
+    // offset, and the receiver has no own entry with the key's hash. each hit checks all of
+    // that, so swapping the prototype, replacing or shadowing the method just misses.
+    // anything else (an undefined prototype too: Object.prototype) is icMiss's
+    if (icMissFunc?.body) link.push(`static PORF_NOINLINE jsval porf_ic_get_slow(PORF_ROOT jsval obj, PORF_ROOT jsval key, i32 hash, i32 slot) {
+  const u32 o = (u32)obj.val;
+  const u32 holder = PORF_LD_RLX((u32*)(MEM + (u32)slot + 4u));
+  if (holder != 0u && porf_jv_type(obj) == ${TYPES.object} && o != 0u && porf_ld_bits(MEM + o + 8u) == (JV_PATTERN | ((u64)${TYPES.object} << 43) | (u64)holder)) {
+    const i32 off = PORF_LD_RLX((i32*)(MEM + (u32)slot));
+    i32 hent, hsize;
+    PORF_OBJ_SNAP(holder, hent, hsize);
+    if (off < hsize * 24) {
+      const u32 e = (u32)hent + (u32)off;
+      if (*(u32*)(MEM + e + 4u) == (u32)key.val && (*(u16*)(MEM + e + 16u) & 1u) == 0u) {
+        i32 ent, size;
+        PORF_OBJ_SNAP(o, ent, size);
+        i32 i = 0;
+        while (i < size && *(i32*)(MEM + (u32)ent + (u32)i * 24u) != hash) i++;
+        if (i == size) return porf_unpack(porf_ld_bits(MEM + e + 8u));
+      }
+    }
+  }
+  return ${fnSym(icMissFunc)}(obj, key, hash, slot);
+}
+
+static inline __attribute__((always_inline)) jsval porf_ic_get(PORF_ROOT jsval obj, PORF_ROOT jsval key, i32 hash, i32 slot) {
   if (porf_jv_type(obj) == ${TYPES.object} && (u32)obj.val != 0u) {
     const i32 off = PORF_LD_RLX((i32*)(MEM + (u32)slot));
     i32 ent, size;
@@ -1607,7 +1634,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
       if (*(u32*)(MEM + e + 4u) == (u32)key.val && (*(u16*)(MEM + e + 16u) & 1u) == 0u) return porf_unpack(porf_ld_bits(MEM + e + 8u));
     }
   }
-  return ${fnSym(icMissFunc)}(obj, key, hash, slot);
+  return porf_ic_get_slow(obj, key, hash, slot);
 }
 `);
 
