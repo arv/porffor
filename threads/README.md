@@ -100,24 +100,27 @@ consistent and checked for alignment.
 Single-threaded code in a program that uses threads, against the same program built without
 them (`bench/` programs and the micro benchmarks in [bench](bench), each also built with
 `new Thread(() => 0).join();` appended; cycles on macOS/clang, time on Linux/gcc 12 and on Wasm,
-all on Apple silicon; Wasm built with wasi-sdk's clang and run on node's V8):
+all on Apple silicon; Wasm built with wasi-sdk's clang and run on node's V8). Code layout alone
+moves these small programs by 3-6%, so both native builds have their functions 64-byte aligned,
+and differences of a percent or two are noise:
 
 | | richards | linked_list | micro_map | object_get | micro_arr | micro_loop |
 |---|---|---|---|---|---|---|
-| macOS, clang | +2.6% | +2.6% | +1.3% | 0% | 0% | 0% |
-| Linux, gcc | +1.8% | +2.7% | +5.4% | +15% | -15% | -1% |
-| Wasm, V8 | +2.5% | +7.0% | 0% | +11.5% | +12.4% | +1.5% |
+| macOS, clang | +3.6% | +3.9% | +1.4% | 0% | 0% | 0% |
+| Linux, gcc | +1.4% | +5% | +5.7% | +12% | -16% | 0% |
+| Wasm, V8 | +4% | +6% | +1.5% | +4.6% | +4.8% | -2% |
 
 Property reads and writes go through inline caches (`porf_ic_get`/`porf_ic_set` in render.js):
 each site remembers where it last found its key, and a hit is a few inline instructions. A
-write hit also checks that this thread owns the object, which is what keeps the ownership
-check off the slow path and nearly free. What remains:
-- **Map/Set** take their container's lock word for every operation (micro_map); inside, the
-  values are plain words under that lock. Under gcc, the lock code still costs a little
-  inlining.
-- **object_get** reads one property in a tight loop. A plain build may keep the loaded value
-  in a register across iterations; a threaded build must load it again each time, since
-  another thread may write it.
+read site that found its key on the receiver's prototype (a method) remembers that prototype
+too. A write hit also checks that this thread owns the object, which is what keeps the
+ownership check off the slow path and nearly free. What remains:
+- **Map/Set** check their container's lock word on every operation (micro_map): for the owner,
+  a load and a compare on the way in and a load and a test on the way out. Inside, the values
+  are plain words under that lock.
+- **Loops** poll for a pending collection or takeover at every back-edge (their clean point),
+  a load and a branch per iteration. In a loop as small as object_get's (one property read),
+  that poll is a large share of the work.
 - **Wasm** keeps its 8-byte accesses atomic: an object's header word, every value (a cache
   hit's two loads, an array element) and the clean points' poll.
 
