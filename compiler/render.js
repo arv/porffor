@@ -5447,6 +5447,11 @@ ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 // array header padded to 16 so inline entries stay 8-aligned
 #define PORF_ARR_LEN(a) (*(i32*)(MEM + (a)))
 #define PORF_ARR_ENT(a) (*(u32*)(MEM + (a) + 4))
+// a word of a container's own array (a Map's values): the container's lock, or owning it, keeps
+// every other writer out, so none of the per-element protocol of porf_arr_get/set. i must be
+// in range. stores still publish with release, for lock-free readers (iteration)
+#define porf_arr_raw_get(a, i) porf_unpack(porf_ld_bits(MEM + PORF_ARR_ENT(a) + ((u64)(u32)(i) << 3)))
+#define porf_arr_raw_set(a, i, v) do { const jsval porf_rv_ = (v); porf_st_bits(MEM + PORF_ARR_ENT(a) + ((u64)(u32)(i) << 3), porf_pack(porf_rv_)); if (porf_gc_type_can_reference(porf_rv_.type)) porf_gc_barrier((u32)(a), ${TYPES.array}); } while (0)
 #define PORF_ARR_CAP(a) (*(i32*)(MEM + (a) + 8))
 
 // with threads readers never lock. capacity never shrinks, and a grow publishes the new

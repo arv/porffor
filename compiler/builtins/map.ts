@@ -18,7 +18,8 @@ export const __Map_prototype_get = function (this: Map, key: any) {
   const index: i32 = __Porffor_hashtableLookup(this, key);
   if (index != -1) {
     const vals: any[] = Porffor.IR.loadI32(this, 4);
-    out = vals[index];
+    // index is from the keys table, so in range, and we hold the lock
+    out = __Porffor_array_rawGet(vals, index);
   }
 
   __Porffor_runlock(Porffor.IR.ptr(this) + 20);
@@ -31,7 +32,7 @@ export const __Map_prototype_set = function (this: Map, key: any, value: any) {
 
   const index: i32 = __Porffor_hashtableLookup(this, key);
   if (index != -1) {
-    vals[index] = value;
+    __Porffor_array_rawSet(vals, index, value);
   } else {
     // push the value first so vals stays in sync if append compacts both arrays
     Porffor.array.fastPush(vals, value);

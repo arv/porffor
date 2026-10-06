@@ -804,6 +804,15 @@ return sign * (i64)((((u64)*(u32*)(MEM + ptr + 4)) << 32) + (u64)*(u32*)(MEM + p
   comptime('__Porffor_array_fromBits', undefined, (scope, decl, { generate }) =>
     Call('porf_arr_unbits', [ generate(scope, decl.arguments[0]) ], T.jsval));
 
+  // a word of a container's own array, under the container's lock (see porf_arr_raw_get)
+  comptime('__Porffor_array_rawGet', undefined, (scope, decl, { generate }) =>
+    Call('porf_arr_raw_get', [ rawPtr(generate(scope, decl.arguments[0])), rawI32(generate(scope, decl.arguments[1])) ], T.jsval));
+
+  comptime('__Porffor_array_rawSet', TYPES.undefined, (scope, decl, { generate, exprStmt }) => {
+    exprStmt(scope, Call('porf_arr_raw_set', [ rawPtr(generate(scope, decl.arguments[0])), rawI32(generate(scope, decl.arguments[1])), generate(scope, decl.arguments[2]) ], T.none));
+    return JvConst(TYPES.undefined, 0);
+  });
+
   comptime('__Porffor_array_has', TYPES.boolean, (scope, decl, { generate }) =>
     Box(Call('porf_arr_has_own', [ rawPtr(generate(scope, decl.arguments[0])), rawI32(generate(scope, decl.arguments[1])) ], T.i32), Const(T.i32, TYPES.boolean)));
 
