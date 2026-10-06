@@ -649,7 +649,23 @@ export const __Porffor_object_lookup = (obj: any, target: any, targetHash: i32):
 
   for (; ptr < endPtr; ptr += 24) {
     if (Porffor.IR.loadI32(ptr, 0) == targetHash) {
-      return ptr;
+      // hashes can collide: the same key string is the usual case, else compare contents
+      // (out of line, keeping this loop lean)
+      if (Porffor.IR.loadI32(ptr, 4) == Porffor.IR.ptr(target)) return ptr;
+      return __Porffor_object_lookupSlow(ptr, endPtr, target, targetHash);
+    }
+  }
+
+  return 0;
+};
+
+// the rest of lookup from an entry whose hash matched but whose key string is another one
+export const __Porffor_object_lookupSlow = (ptr: i32, endPtr: i32, target: any, targetHash: i32): i32 => {
+  for (; ptr < endPtr; ptr += 24) {
+    if (Porffor.IR.loadI32(ptr, 0) == targetHash) {
+      let same: i32 = 0;
+      Porffor.c`same = porf_entry_key_eq((u32)ptr, target);`;
+      if (same) return ptr;
     }
   }
 
@@ -762,7 +778,7 @@ export const __Porffor_object_get_ic = (_obj: any, key: any, hash: i32, slot: i3
       Porffor.c`PORF_OBJ_SNAP(o, entriesPtr, size);`;
       if (off < size * 24) {
         const entryPtr: i32 = entriesPtr + off;
-        if (Porffor.IR.loadI32(entryPtr, 0) == hash) {
+        if (Porffor.IR.loadI32(entryPtr, 4) == Porffor.IR.ptr(key)) {
           if ((Porffor.IR.loadU16(entryPtr, 16) & 0b0001) == 0) return __Porffor_object_readValue(entryPtr);
         }
       }
@@ -776,19 +792,17 @@ export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot
   if (Porffor.type(_obj) == Porffor.TYPES.object) {
     if (Porffor.IR.ptr(_obj) != 0) {
       const o: i32 = Porffor.IR.ptr(_obj);
-      let entriesPtr: i32 = 0;
-      let size: i32 = 0;
-      Porffor.c`PORF_OBJ_SNAP(o, entriesPtr, size);`;
-      let ptr: i32 = entriesPtr;
-      const endPtr: i32 = ptr + size * 24;
-      for (; ptr < endPtr; ptr += 24) {
-        if (Porffor.IR.loadI32(ptr, 0) == hash) {
-          // first writer wins so polymorphic sites miss instead of storing each time
-          Porffor.c`{ i32 porf_ic_free_ = 2147483647; __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(ptr - entriesPtr), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); }`;
-          if ((Porffor.IR.loadU16(ptr, 16) & 0b0001) == 0) return __Porffor_object_readValue(ptr);
-          break;
-        }
+      const ptr: i32 = __Porffor_object_lookup(_obj, key, hash);
+      if (ptr == 0) return __Porffor_object_getInherited(_obj, _obj, key, hash, Porffor.TYPES.object);
+      // first writer wins so polymorphic sites miss instead of storing each time. only an
+      // entry keyed by this site's own key string: hits compare key pointers
+      if (Porffor.IR.loadI32(ptr, 4) == Porffor.IR.ptr(key)) {
+        let entriesPtr: i32 = 0;
+        let size: i32 = 0;
+        Porffor.c`PORF_OBJ_SNAP(o, entriesPtr, size);`;
+        Porffor.c`{ i32 porf_ic_free_ = 2147483647; __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(ptr - entriesPtr), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); }`;
       }
+      return __Porffor_object_readEntry(_obj, ptr);
     }
   }
 
@@ -799,30 +813,27 @@ export const __Porffor_object_get_icMiss = (_obj: any, key: any, hash: i32, slot
 // the entry when it is an own writable data property. first writer wins, as for reads
 export const __Porffor_object_set_icMiss = (obj: any, key: any, value: any, hash: i32, slot: i32): any => {
   __Porffor_object_set_withHash(obj, key, value, hash);
-  __Porffor_object_icFillWrite(obj, hash, slot);
+  __Porffor_object_icFillWrite(obj, key, hash, slot);
   return value;
 };
 
 export const __Porffor_object_setStrict_icMiss = (obj: any, key: any, value: any, hash: i32, slot: i32): any => {
   __Porffor_object_setStrict_withHash(obj, key, value, hash);
-  __Porffor_object_icFillWrite(obj, hash, slot);
+  __Porffor_object_icFillWrite(obj, key, hash, slot);
   return value;
 };
 
-export const __Porffor_object_icFillWrite = (obj: any, hash: i32, slot: i32): void => {
+export const __Porffor_object_icFillWrite = (obj: any, key: any, hash: i32, slot: i32): void => {
   if (Porffor.type(obj) != Porffor.TYPES.object) return;
   const o: i32 = Porffor.IR.ptr(obj);
   if (o == 0) return;
-  let entriesPtr: i32 = 0;
-  let size: i32 = 0;
-  Porffor.c`PORF_OBJ_SNAP(o, entriesPtr, size);`;
-  let ptr: i32 = entriesPtr;
-  const endPtr: i32 = ptr + size * 24;
-  for (; ptr < endPtr; ptr += 24) {
-    if (Porffor.IR.loadI32(ptr, 0) == hash) {
-      if ((Porffor.IR.loadU8(ptr, 16) & 0b1001) == 0b1000) Porffor.c`{ i32 porf_ic_free_ = 2147483647; __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(ptr - entriesPtr), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); }`;
-      return;
-    }
+  const ptr: i32 = __Porffor_object_lookup(obj, key, hash);
+  if (ptr == 0) return;
+  if (Porffor.fastAnd((Porffor.IR.loadU8(ptr, 16) & 0b1001) == 0b1000, Porffor.IR.loadI32(ptr, 4) == Porffor.IR.ptr(key))) {
+    let entriesPtr: i32 = 0;
+    let size: i32 = 0;
+    Porffor.c`PORF_OBJ_SNAP(o, entriesPtr, size);`;
+    Porffor.c`{ i32 porf_ic_free_ = 2147483647; __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(ptr - entriesPtr), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); }`;
   }
 };
 
@@ -838,36 +849,45 @@ export const __Porffor_object_get_withHash = (_obj: any, key: any, hash: i32): a
 
   let entryPtr: i32 = 0;
   if (Porffor.type(obj) == Porffor.TYPES.object) entryPtr = __Porffor_object_lookup(obj, key, hash);
-  if (entryPtr == 0) {
-    // check prototype chain
-    if (trueType == Porffor.TYPES.object) {
-      obj = __Porffor_object_getPrototype(obj);
-      // if undefined, prototype is object.prototype
-      if (Porffor.type(obj) == Porffor.TYPES.undefined) obj = __Object_prototype;
-    } else obj = __Porffor_object_getPrototypeWithHidden(obj, trueType);
+  if (entryPtr == 0) return __Porffor_object_getInherited(_obj, obj, key, hash, trueType);
+  return __Porffor_object_readEntry(_obj, entryPtr);
+};
 
-    let proto: any = obj;
-    if (Porffor.type(obj) != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
-    if (obj == null) return undefined;
-    while (true) {
-      if ((entryPtr = __Porffor_object_lookup(obj, key, hash)) != 0) break;
+// the rest of a get when obj (the receiver _obj, or its underlying object) has no own entry
+// for key: the prototype chain. trueType is the receiver's type
+export const __Porffor_object_getInherited = (_obj: any, obj: any, key: any, hash: i32, trueType: i32): any => {
+  if (trueType == Porffor.TYPES.object) {
+    obj = __Porffor_object_getPrototype(obj);
+    // if undefined, prototype is object.prototype
+    if (Porffor.type(obj) == Porffor.TYPES.undefined) obj = __Object_prototype;
+  } else obj = __Porffor_object_getPrototypeWithHidden(obj, trueType);
 
-      // inline get prototype
-      obj = __Porffor_object_getPrototype(obj);
-      if (Porffor.type(obj) == Porffor.TYPES.undefined) {
-        obj = __Porffor_object_getHiddenPrototype(Porffor.type(proto));
-        if (Porffor.IR.ptr(obj) == Porffor.IR.ptr(proto)) obj = __Object_prototype;
-      }
-      if (Porffor.IR.ptr(obj) == Porffor.IR.ptr(proto)) break;
+  let entryPtr: i32 = 0;
+  let proto: any = obj;
+  if (Porffor.type(obj) != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
+  if (obj == null) return undefined;
+  while (true) {
+    if ((entryPtr = __Porffor_object_lookup(obj, key, hash)) != 0) break;
 
-      proto = obj;
-      if (Porffor.type(obj) != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
-      if (obj == null) break;
+    // inline get prototype
+    obj = __Porffor_object_getPrototype(obj);
+    if (Porffor.type(obj) == Porffor.TYPES.undefined) {
+      obj = __Porffor_object_getHiddenPrototype(Porffor.type(proto));
+      if (Porffor.IR.ptr(obj) == Porffor.IR.ptr(proto)) obj = __Object_prototype;
     }
+    if (Porffor.IR.ptr(obj) == Porffor.IR.ptr(proto)) break;
 
-    if (entryPtr == 0) return undefined;
+    proto = obj;
+    if (Porffor.type(obj) != Porffor.TYPES.object) obj = __Porffor_object_underlying(obj);
+    if (obj == null) break;
   }
 
+  if (entryPtr == 0) return undefined;
+  return __Porffor_object_readEntry(_obj, entryPtr);
+};
+
+// an entry's value for the receiver _obj: its value, or its getter called on _obj
+export const __Porffor_object_readEntry = (_obj: any, entryPtr: i32): any => {
   const tail: i32 = Porffor.IR.loadU16(entryPtr, 16);
   if (tail & 0b0001) {
     // accessor descriptor

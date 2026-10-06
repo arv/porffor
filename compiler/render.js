@@ -117,7 +117,7 @@ const cReservedNames = new Set([
 // inlining these has little perf benefit and significantly increases binary size
 const NEVER_INLINE = new Set([
   '__Porffor_object_get_ic', '__Porffor_object_get_icMiss', '__Porffor_object_get_withHash',
-  '__Porffor_object_set_icMiss', '__Porffor_object_setStrict_icMiss'
+  '__Porffor_object_set_icMiss', '__Porffor_object_setStrict_icMiss', '__Porffor_object_lookupSlow'
 ]);
 
 const sanitizeMemo = new Map();
@@ -1591,7 +1591,9 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     link.push(...linkProtos);
 
     // a read IC hit inline at the site (see genericMemberGet in codegen; always inlined: gcc
-    // otherwise calls it, costing richards 11%): the entry the site last found, at its byte offset in the entries block, still with the same hash and still
+    // otherwise calls it, costing richards 11%). sites cache only entries keyed by their own
+    // static key string, so a hit compares key pointers (hashes alone can collide): the entry
+    // the site last found, at its byte offset in the entries block, still with the same key and still
     // a data property. anything else is the out-of-line miss, which looks the key up and
     // fills the site
     const icMissFunc = funcByName.get('__Porffor_object_get_icMiss');
@@ -1602,7 +1604,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     PORF_OBJ_SNAP((u32)obj.val, ent, size);
     if (off < size * 24) {
       const u32 e = (u32)ent + (u32)off;
-      if (*(i32*)(MEM + e) == hash && (*(u16*)(MEM + e + 16u) & 1u) == 0u) return porf_unpack(porf_ld_bits(MEM + e + 8u));
+      if (*(u32*)(MEM + e + 4u) == (u32)key.val && (*(u16*)(MEM + e + 16u) & 1u) == 0u) return porf_unpack(porf_ld_bits(MEM + e + 8u));
     }
   }
   return ${fnSym(icMissFunc)}(obj, key, hash, slot);
@@ -1610,7 +1612,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
 `);
 
     // a write IC hit inline at the site (see genericMemberSet in codegen): the site's entry,
-    // still with the same hash and still a writable data property, of an object this thread
+    // still with the same key and still a writable data property, of an object this thread
     // owns (always, without threads: nothing else can move its entries), written in place.
     // anything else is the out-of-line miss: the ordinary set, then filling the site
     for (const [ name, miss ] of [ [ 'porf_ic_set', '__Porffor_object_set_icMiss' ], [ 'porf_ic_set_strict', '__Porffor_object_setStrict_icMiss' ] ]) {
@@ -1623,7 +1625,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     PORF_OBJ_SNAP(o, ent, size);
     if (off < size * 24 && porf_ttl_mine(o + 20u)) {
       const u32 e = (u32)ent + (u32)off;
-      if (*(i32*)(MEM + e) == hash && (*(u8*)(MEM + e + 16u) & 0x9u) == 0x8u) {
+      if (*(u32*)(MEM + e + 4u) == (u32)key.val && (*(u8*)(MEM + e + 16u) & 0x9u) == 0x8u) {
         porf_st_bits(MEM + e + 8u, porf_pack(v));
         if (porf_gc_type_can_reference(v.type)) porf_gc_barrier(o, ${TYPES.object});
         return v;
@@ -6044,6 +6046,15 @@ ${sti}i32 porf_strict_eq(jsval a, jsval b) {
   if (ta == ${TYPES.bigint}) return porf_bigint_cmp(a, b) == 0;
   return (u32)a.val == (u32)b.val;
 }
+
+// the object entry at e is keyed by key: the same string or symbol (the usual case), else a
+// string equal by content. two keys' hashes can collide, so matching a hash is not enough
+static PORF_COLD i32 porf_entry_key_eq_slow(u32 e, jsval key) {
+  const u8 t = *(u8*)(MEM + e + 18u);
+  if (t == ${TYPES.symbol}) return 0;
+  return porf_strict_eq(porf_box((f64)*(u32*)(MEM + e + 4u), t), key);
+}
+#define porf_entry_key_eq(e, key) (*(u32*)(MEM + (u32)(e) + 4u) == (u32)(key).val || porf_entry_key_eq_slow((u32)(e), (key)))
 
 static int porf_argc;
 static char** porf_argv;
