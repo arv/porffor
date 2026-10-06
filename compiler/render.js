@@ -1590,12 +1590,12 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     for (const f of linkFuncs) link.push(proto(f));
     link.push(...linkProtos);
 
-    // a read IC hit inline at the site (see genericMemberGet in codegen): the entry the site
-    // last found, at its byte offset in the entries block, still with the same hash and still
+    // a read IC hit inline at the site (see genericMemberGet in codegen; always inlined: gcc
+    // otherwise calls it, costing richards 11%): the entry the site last found, at its byte offset in the entries block, still with the same hash and still
     // a data property. anything else is the out-of-line miss, which looks the key up and
     // fills the site
     const icMissFunc = funcByName.get('__Porffor_object_get_icMiss');
-    if (icMissFunc?.body) link.push(`static inline jsval porf_ic_get(PORF_ROOT jsval obj, PORF_ROOT jsval key, i32 hash, i32 slot) {
+    if (icMissFunc?.body) link.push(`static inline __attribute__((always_inline)) jsval porf_ic_get(PORF_ROOT jsval obj, PORF_ROOT jsval key, i32 hash, i32 slot) {
   if (porf_jv_type(obj) == ${TYPES.object} && (u32)obj.val != 0u) {
     const i32 off = PORF_LD_RLX((i32*)(MEM + (u32)slot));
     i32 ent, size;
@@ -1615,7 +1615,7 @@ export default ({ funcs, data = [], dataUnits = [], globals = [], globalInits = 
     // anything else is the out-of-line miss: the ordinary set, then filling the site
     for (const [ name, miss ] of [ [ 'porf_ic_set', '__Porffor_object_set_icMiss' ], [ 'porf_ic_set_strict', '__Porffor_object_setStrict_icMiss' ] ]) {
       const missFunc = funcByName.get(miss);
-      if (missFunc?.body) link.push(`static inline jsval ${name}(PORF_ROOT jsval obj, PORF_ROOT jsval key, PORF_ROOT jsval v, i32 hash, i32 slot) {
+      if (missFunc?.body) link.push(`static inline __attribute__((always_inline)) jsval ${name}(PORF_ROOT jsval obj, PORF_ROOT jsval key, PORF_ROOT jsval v, i32 hash, i32 slot) {
   if (porf_jv_type(obj) == ${TYPES.object} && (u32)obj.val != 0u) {
     const u32 o = (u32)obj.val;
     const i32 off = PORF_LD_RLX((i32*)(MEM + (u32)slot));
