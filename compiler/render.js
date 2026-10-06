@@ -6054,11 +6054,20 @@ ${sti}i32 porf_strict_eq(jsval a, jsval b) {
 }
 
 // the object entry at e is keyed by key: the same string or symbol (the usual case), else a
-// string equal by content. two keys' hashes can collide, so matching a hash is not enough
+// string equal by content. two keys' hashes can collide, so matching a hash is not enough.
+// compares by itself: calling the inline porf_strict_eq from this cold path left clang an
+// out of line copy, which it then called for === elsewhere too (linked_list +3% threaded)
 static PORF_COLD i32 porf_entry_key_eq_slow(u32 e, jsval key) {
-  const u8 t = *(u8*)(MEM + e + 18u);
-  if (t == ${TYPES.symbol}) return 0;
-  return porf_strict_eq(porf_box((f64)*(u32*)(MEM + e + 4u), t), key);
+  const u32 ta = *(u8*)(MEM + e + 18u), tb = (u32)porf_jv_type(key);
+  if ((ta != ${TYPES.bytestring} && ta != ${TYPES.string}) || (tb != ${TYPES.bytestring} && tb != ${TYPES.string})) return 0;
+  const u32 pa = *(u32*)(MEM + e + 4u), pb = (u32)key.val, n = *(u32*)(MEM + pa);
+  if (n != *(u32*)(MEM + pb)) return 0;
+  for (u32 i = 0; i < n; i++) {
+    const u32 ca = ta == ${TYPES.string} ? *(u16*)(MEM + pa + 4u + i * 2u) : MEM[pa + 4u + i];
+    const u32 cb = tb == ${TYPES.string} ? *(u16*)(MEM + pb + 4u + i * 2u) : MEM[pb + 4u + i];
+    if (ca != cb) return 0;
+  }
+  return 1;
 }
 #define porf_entry_key_eq(e, key) (*(u32*)(MEM + (u32)(e) + 4u) == (u32)(key).val || porf_entry_key_eq_slow((u32)(e), (key)))
 
