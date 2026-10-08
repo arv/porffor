@@ -324,10 +324,16 @@ export const __Porffor_object_underlying = (_obj: any): any => {
   // need for the lock (underlyingLocked returns them as they are too)
   if (Porffor.type(_obj) <= 0x05) return _obj;
 
+  // this thread's cache first (porf_ucache_get in render.js): a hit takes no lock
+  let cached: i32 = 0;
+  Porffor.c`cached = (i32)porf_ucache_get((u32)_obj.val, (u32)porf_jv_type(_obj));`;
+  if (cached != 0) return cached as object;
+
   // the underlying store is shared by every thread
   Porffor.c`porf_builtin_lock();`;
   const out: any = __Porffor_object_underlyingLocked(_obj);
   Porffor.c`porf_builtin_unlock();`;
+  if (Porffor.type(out) == Porffor.TYPES.object) Porffor.c`porf_ucache_put((u32)_obj.val, (u32)porf_jv_type(_obj), (u32)out.val);`;
   return out;
 };
 

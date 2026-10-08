@@ -4435,6 +4435,7 @@ static void porf_gc_collect_impl(int minor) {
   for (porf_tstate* t = porf_threads; t != NULL; t = t->next) {
     porf_ts_set(t);
     for (i32 ci = 0; ci < PORF_GC_NCLASSES; ci++) porf_gc_publish_window(ci);
+    memset(t->ucache, 0, sizeof(t->ucache));
   }
   porf_ts_set(porf_gc_collector);` : `${st}void porf_gc_collect(int minor) {
   if (porf_heap_base == 0) return;
@@ -4572,6 +4573,7 @@ typedef struct porf_tstate {
   void* stack_lo;
   jmp_buf regs;
   struct porf_tstate* next;
+  struct { u32 key, type, val, _; } ucache[64]; // see porf_ucache_get
 } porf_tstate;
 
 static porf_tstate porf_main_ts;
@@ -5490,6 +5492,21 @@ static inline int porf_obj_store_live(u32 o, u32 e, u32 hash, u32 key, u32 key_t
   porf_obj_unlock(o);
   return live;
 }
+// this thread's cache of underlying objects (see __Porffor_object_underlying), so a hit takes
+// no builtin lock. between collections the shared store only gains entries and a key's
+// underlying object never changes; a collection drops dead keys, whose addresses may come
+// back as other objects, so every collection empties every thread's cache. 0: not cached
+static inline u32 porf_ucache_slot(u32 p, u32 type) { return ((p >> 4) ^ (p >> 11) ^ type) & 63u; }
+static inline u32 porf_ucache_get(u32 p, u32 type) {
+  const porf_tstate* t = porf_ts;
+  const u32 i = porf_ucache_slot(p, type);
+  return t->ucache[i].key == p && t->ucache[i].type == type ? t->ucache[i].val : 0u;
+}
+static inline void porf_ucache_put(u32 p, u32 type, u32 val) {
+  porf_tstate* t = porf_ts;
+  const u32 i = porf_ucache_slot(p, type);
+  t->ucache[i].key = p; t->ucache[i].type = type; t->ucache[i].val = val;
+}
 ` : `static inline u64 porf_obj_snap(u32 o) { return *(u64*)(MEM + o); }
 static inline void porf_obj_publish(u32 o, u64 shape) { *(u64*)(MEM + o) = shape; }
 static inline void porf_obj_store_word(u32 p, u64 w) { *(u64*)(MEM + p) = w; }
@@ -5500,6 +5517,8 @@ static inline void porf_obj_store_word(u32 p, u64 w) { *(u64*)(MEM + p) = w; }
 #define porf_ttl_mine(p) 1
 #define porf_self_tag() 0u
 #define porf_obj_store_live(o, e, hash, key, key_type, flags, w) 0
+#define porf_ucache_get(p, type) 0u
+#define porf_ucache_put(p, type, val) ((void)0)
 `}
 ${prefs.gc === false ? PORF_BUMP_ALLOC() : PORF_GC_ALLOC(prefs, threads)}
 
