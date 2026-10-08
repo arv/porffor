@@ -320,6 +320,9 @@ export const __Porffor_underlyingRebuild = (): void => {
 
 export const __Porffor_object_underlying = (_obj: any): any => {
   if (Porffor.type(_obj) == Porffor.TYPES.object) return _obj;
+  // undefined, numbers, booleans... have none, and are what ends every prototype walk: no
+  // need for the lock (underlyingLocked returns them as they are too)
+  if (Porffor.type(_obj) <= 0x05) return _obj;
 
   // the underlying store is shared by every thread
   Porffor.c`porf_builtin_lock();`;
