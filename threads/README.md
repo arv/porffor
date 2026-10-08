@@ -1,6 +1,11 @@
 # Threads: shared everything
 
-Porffor threads follow WebKit's ["Concurrent JavaScript: It can work!"](https://webkit.org/blog/7846/concurrent-javascript-it-can-work/):
+> **Disclaimer:** this was mostly done iterating with the help of Claude Code (Claude Opus 5.5),
+> disclosed per Porffor's [AI policy](../AI_POLICY.md).
+
+Porffor threads follow WebKit's ["Concurrent JavaScript: It can work!"](https://webkit.org/blog/7846/concurrent-javascript-it-can-work/)
+(as does Bun's work on shared-memory threads for JavaScriptCore,
+[oven-sh/WebKit#249](https://github.com/oven-sh/WebKit/pull/249)):
 every thread runs in the same heap, so objects, arrays, Maps, closures and globals are shared
 by default. Racing accesses are allowed. They may observe any interleaving, but they never
 crash, never see a torn or made-up value, and never lose a write to an unrelated property or
@@ -22,8 +27,26 @@ console.log(threads.map(t => t.join())); // [ 0, 2, 4, 6 ]
 [demo.js](demo.js) shows more (Maps, `Atomics.wait`/`notify`, `asyncJoin`):
 `node runtime/index.js threads/demo.js`, or `node runtime/index.js native threads/demo.js -o demo`.
 
-A program that never uses `Thread` compiles exactly as before: everything here is only built
-in when it does.
+A program that never uses `Thread` compiles none of this in: everything here is only built in
+when it does.
+
+## Size
+
+Against `main` (72d048d7), lines added and removed:
+
+| | added | removed |
+|---|---|---|
+| C runtime and emitter (`compiler/render.js`) | 1503 | 150 |
+| builtins (`compiler/builtins/*.ts`) | 1123 | 371 |
+| codegen (`compiler/codegen.js`) | 88 | 53 |
+| other compiler files | 64 | 2 |
+| tests (`threads/tests`: 24 programs and their expected output) | 914 | |
+| these notes, the demo, benchmarks and test runner | 336 | |
+| test262's `$262.agent` host | 134 | 1 |
+
+About 500 of the compiler lines are not about threads: inline caches and other speedups that
+help single-threaded programs too (~320), and fixes picked up along the way (bigints and Wasm
+GC roots ~140, the collector ~30). Threads themselves are about 2.3k.
 
 ## API
 
@@ -82,7 +105,10 @@ and promise has a lock word, initially the tag of the thread that allocated it.
 
 **Builtin state** that used to be process-wide is per thread: regex compiler scratch and
 caches, DataView scratch, and builtin array literals. The few tables every thread must share
-(the `Symbol.for` registry, the hidden-props store) are locked.
+(the `Symbol.for` registry, the hidden-props store) are locked. Each thread caches its
+hidden-props lookups (a function's `prototype`, say, read by every `new`), so the common case
+takes no lock: between collections that store only gains entries, and every collection empties
+every thread's cache.
 
 **Garbage collection** stops the world.
 - Each thread allocates from its own windows and parks at a safepoint, either in the
@@ -102,13 +128,22 @@ them (`bench/` programs and the micro benchmarks in [bench](bench), each also bu
 `new Thread(() => 0).join();` appended; cycles on macOS/clang, time on Linux/gcc 12 and on Wasm,
 all on Apple silicon; Wasm built with wasi-sdk's clang and run on node's V8). Code layout alone
 moves these small programs by 3-6%, so both native builds have their functions 64-byte aligned,
+the clang numbers for richards, linked_list and micro_map are the mean over four block layouts,
 and differences of a percent or two are noise:
 
 | | richards | linked_list | micro_map | object_get | micro_arr | micro_loop |
 |---|---|---|---|---|---|---|
-| macOS, clang | +3.6% | +3.9% | +1.4% | 0% | 0% | 0% |
-| Linux, gcc | +1.4% | +5% | +5.7% | +12% | -16% | 0% |
-| Wasm, V8 | +4% | +6% | +1.5% | +4.6% | +4.8% | -2% |
+| macOS, clang | +4.1% | +6.5% | +2.1% | 0% | 0% | 0% |
+| Linux, gcc | +4.7% | +3.5% | +5.0% | +1% | +18% | -1% |
+| Wasm, V8 | +7% | +3.6% | +2.1% | +4.6% | +5.2% | -2% |
+
+On v8-v7 (clang, best of six runs per benchmark, as GC-heavy ones vary from run to run) the
+threaded build scores 1.0% lower overall: Richards -3.5%, DeltaBlue, RegExp and Splay about
+-2.5%, Crypto and RayTrace about -1%, EarleyBoyer +0.7%, NavierStokes +3.5%.
+
+gcc's numbers move with its inlining and block placement more than with the threads code:
+micro_arr went from 16% faster threaded to 18% slower after a change to a cold path that the
+loop never takes, which only moved how gcc laid out the code around it.
 
 Property reads and writes go through inline caches (`porf_ic_get`/`porf_ic_set` in render.js):
 each site remembers where it last found its key, and a hit is a few inline instructions. A
