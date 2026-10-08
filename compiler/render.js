@@ -3074,7 +3074,11 @@ static int porf_gc_refill_window(i32 ci) {
 }
 
 ${st}u32 porf_alloc_slow(u32 bytes, u32 typeId);
-${sti}u32 porf_alloc(u32 bytes, u32 typeId) {
+// never inlined with threads: its safepoint, per-thread windows and locked slow path make it
+// big enough that inlining it at every allocation site (most of them cold) used up clang's
+// inlining budget for large functions, leaving their hot paths calling ToNumeric and the
+// like (v8-v7's NavierStokes ran 45% slower threaded; 2% with this)
+${threads ? 'static PORF_NOINLINE ' : sti}u32 porf_alloc(u32 bytes, u32 typeId) {
 ${threads ? '  PORF_SAFEPOINT();\n' : ''}\
   if (bytes <= PORF_GC_MAX_SMALL) {
     const u32 ci = porf_gc_cls_lut[(bytes + 7u) >> 3];
@@ -5224,7 +5228,7 @@ ${toStr ? `
 
 // internal throws construct a standard error (message jsval at +0, like the error
 // builtins) so a caught internal error behaves identically to a \`new X(msg)\` one
-${sti}u32 porf_alloc(u32 bytes, u32 typeId);
+${threads ? 'static PORF_NOINLINE ' : sti}u32 porf_alloc(u32 bytes, u32 typeId);
 PORF_NORETURN ${st}void porf_throw_new(i32 errType, u32 msgId) {
   const u32 p = porf_alloc(8, (u32)errType);
   *(jsbits*)(MEM + p) = JV_PATTERN | ((u64)${TYPES.bytestring} << 43) | msgId;

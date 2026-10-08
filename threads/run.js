@@ -31,12 +31,13 @@ const tsanBenign = {
 
 // porf_alloc forces a minor collection every N allocations, except inside one it caused
 const stress = (c, n) => {
+  // never inlined in threaded programs, inline in the rest (tests without a Thread)
+  const head = [ 'static PORF_NOINLINE', 'static inline' ].map(q => `${q} u32 porf_alloc(u32 bytes, u32 typeId) {\n`).find(x => c.includes(x)) ?? 'porf_alloc(u32 bytes, u32 typeId) {\n';
   const reps = [
-    [ 'static inline u32 porf_alloc(u32 bytes, u32 typeId) {\n', `static void porf_gc_minor(void);
+    [ head, `static void porf_gc_minor(void);
 static u32 porf_stress_n;
 static _Thread_local int porf_stress_busy;
-static inline u32 porf_alloc(u32 bytes, u32 typeId) {
-  if (porf_heap_base != 0 && !porf_stress_busy && (__atomic_add_fetch(&porf_stress_n, 1, __ATOMIC_RELAXED) % ${n}) == 0) { porf_stress_busy++; porf_gc_minor(); porf_stress_busy--; }
+${head}  if (porf_heap_base != 0 && !porf_stress_busy && (__atomic_add_fetch(&porf_stress_n, 1, __ATOMIC_RELAXED) % ${n}) == 0) { porf_stress_busy++; porf_gc_minor(); porf_stress_busy--; }
 ` ],
     [ 'if (porf_gc_refill_window((i32)ci)) return porf_alloc(bytes, typeId);',
       'if (porf_gc_refill_window((i32)ci)) { porf_stress_busy++; const u32 r = porf_alloc(bytes, typeId); porf_stress_busy--; return r; }' ]
