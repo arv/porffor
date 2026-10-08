@@ -822,12 +822,14 @@ PORF_OBJ_SNAP((u32)holder, hEnt, hSize);`;
       const ptr: i32 = __Porffor_object_lookup(_obj, key, hash);
       if (ptr == 0) return __Porffor_object_getInheritedIC(_obj, key, hash, slot);
       // first writer wins so polymorphic sites miss instead of storing each time. only an
-      // entry keyed by this site's own key string: hits compare key pointers
+      // entry keyed by this site's own key string: hits compare key pointers. a
+      // filled slot is read before any CAS: a failing one still takes the line exclusive, and
+      // sites that always miss (adds, polymorphic) came here on every access
       if (Porffor.IR.loadI32(ptr, 4) == Porffor.IR.ptr(key)) {
         let entriesPtr: i32 = 0;
         let size: i32 = 0;
         Porffor.c`PORF_OBJ_SNAP(o, entriesPtr, size);`;
-        Porffor.c`{ i32 porf_ic_free_ = 2147483647; __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(ptr - entriesPtr), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); }`;
+        Porffor.c`{ i32 porf_ic_free_ = 2147483647; if (PORF_LD_RLX((i32*)(MEM + (u32)slot)) == porf_ic_free_) __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(ptr - entriesPtr), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); }`;
       }
       return __Porffor_object_readEntry(_obj, ptr);
     }
@@ -860,7 +862,7 @@ export const __Porffor_object_icFillWrite = (obj: any, key: any, hash: i32, slot
     let entriesPtr: i32 = 0;
     let size: i32 = 0;
     Porffor.c`PORF_OBJ_SNAP(o, entriesPtr, size);`;
-    Porffor.c`{ i32 porf_ic_free_ = 2147483647; __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(ptr - entriesPtr), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); }`;
+    Porffor.c`{ i32 porf_ic_free_ = 2147483647; if (PORF_LD_RLX((i32*)(MEM + (u32)slot)) == porf_ic_free_) __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(ptr - entriesPtr), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); }`;
   }
 };
 
@@ -908,7 +910,7 @@ export const __Porffor_object_getInheritedIC = (_obj: any, key: any, hash: i32, 
         let pEnt: i32 = 0;
         let pSize: i32 = 0;
         Porffor.c`PORF_OBJ_SNAP((u32)p, pEnt, pSize);
-{ i32 porf_ic_free_ = 2147483647; if (__atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(e - pEnt), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) __atomic_store_n((u32*)(MEM + (u32)slot + 4u), (u32)p, __ATOMIC_RELAXED); }`;
+{ i32 porf_ic_free_ = 2147483647; if (PORF_LD_RLX((i32*)(MEM + (u32)slot)) == porf_ic_free_ && __atomic_compare_exchange_n((i32*)(MEM + (u32)slot), &porf_ic_free_, (i32)(e - pEnt), 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) __atomic_store_n((u32*)(MEM + (u32)slot + 4u), (u32)p, __ATOMIC_RELAXED); }`;
       }
       return __Porffor_object_readEntry(_obj, e);
     }
