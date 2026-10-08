@@ -4119,7 +4119,7 @@ ${threads ? `  if (porf_ts != porf_gc_collector) {
     porf_gc_cons_scan_range((const u64*)&regs, (const u64*)((const char*)&regs + sizeof(regs)));
   }
   volatile u64 anchor = 0;
-  const u64* lo = (const u64*)(((uintptr_t)&anchor + 7) & ~(uintptr_t)7);
+  const u64* lo = (const u64*)(((uintptr_t)PORF_STACK_LO(&anchor) + 7) & ~(uintptr_t)7);
   const u64* hi = (const u64*)porf_c_stack_top;
   if (lo < hi) porf_gc_cons_scan_range(lo, hi);
 ${threads ? '  }\n' : ''}\
@@ -4622,7 +4622,7 @@ static pthread_cond_t porf_stw_cond = PTHREAD_COND_INITIALIZER;
 
 // save what the collector needs to scan this thread: callee-saved registers and
 // the live end of the stack. the caller must not touch the heap until it resumes
-#define PORF_SAVE_STACK(t) do { volatile u64 porf_anchor_ = 0; (void)_setjmp((t)->regs); (t)->stack_lo = (void*)&porf_anchor_; } while (0)
+#define PORF_SAVE_STACK(t) do { volatile u64 porf_anchor_ = 0; (void)_setjmp((t)->regs); (t)->stack_lo = PORF_STACK_LO(&porf_anchor_); } while (0)
 
 // a thread stops here while another one collects
 static PORF_NOINLINE void porf_park(void) {
@@ -4902,6 +4902,18 @@ ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #define PORF_NOINLINE __attribute__((noinline))
 // out of the common path: keeps it free of the spills a possible call would cost
 #define PORF_COLD __attribute__((noinline, cold))
+// where a conservative scan of this thread's stack starts: the stack pointer, so the whole
+// current frame is in it. a local's address is not enough: gcc (arm64) spills callee-saved
+// registers below the locals, and a caller's value whose register this function reuses
+// before its setjmp lives only in that spill (porf_gc_lock_acquire did, losing strings to
+// a collection whenever it had to wait for the lock)
+#if defined(__aarch64__)
+#define PORF_STACK_LO(anchor) ({ void* porf_sp_; __asm__ volatile("mov %0, sp" : "=r"(porf_sp_)); porf_sp_; })
+#elif defined(__x86_64__)
+#define PORF_STACK_LO(anchor) ({ void* porf_sp_; __asm__ volatile("mov %%rsp, %0" : "=r"(porf_sp_)); porf_sp_; })
+#else
+#define PORF_STACK_LO(anchor) ((void*)(anchor))
+#endif
 // run-once code (module init, top level): optimize for size whatever -O the unit gets
 #if defined(__clang__)
 #define PORF_ONCE __attribute__((noinline, minsize))
