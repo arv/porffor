@@ -21,6 +21,14 @@ node threads/playground/serve.js   # then open http://localhost:8787/threads/pla
 
 `WASI_SYSROOT`, `CLANG_RT` and `WASM_CLANG` point it elsewhere.
 
+## Deploying
+
+[Dockerfile](Dockerfile) builds everything with wasi-sdk and serves it on `$PORT`
+(`docker build -f threads/playground/Dockerfile .` from the repository root). On Railway, deploy
+the repository (from GitHub, or `railway up`) with the service variable
+`RAILWAY_DOCKERFILE_PATH=threads/playground/Dockerfile`, then generate a domain. Any static host
+works too, with `build/` uploaded alongside: `sw.js` supplies the headers it cannot send.
+
 ## How it works
 
 - **JS to C**: `compiler.worker.js` imports Porffor's compiler from `../../compiler/`,

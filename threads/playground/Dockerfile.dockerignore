@@ -1,0 +1,7 @@
+# with the Dockerfile beside it (BuildKit); the build stage makes build/ itself
+.git
+.claude
+test262
+selfhosted
+thread-demo
+threads/playground/build
