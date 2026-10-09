@@ -2,6 +2,8 @@
 // the JS into C, then clang (LLVM built for Wasm by YoWASP) builds the C for
 // wasm32-wasip1-threads against the sysroot that build.js packs
 const YOWASP = 'https://cdn.jsdelivr.net/npm/@yowasp/clang@22.0.0-git20542-10/gen/bundle.js';
+// wabt's wasm2wat, for showing a module as WebAssembly text
+const WABT = 'https://cdn.jsdelivr.net/npm/wabt@1.0.39/+esm';
 
 // the flags build.js gives the native clang (keep them in step)
 const clangFlags = [
@@ -80,13 +82,27 @@ const toWasm = async (c, progress) => {
   }
 };
 
+let wabt;
+const toWat = async bytes => {
+  wabt ??= (await import(WABT)).default();
+  const module = (await wabt).readWasm(bytes, { readDebugNames: true, threads: true, exceptions: true });
+  try {
+    module.applyNames();
+    return module.toText({ foldExprs: false, inlineExport: false });
+  } finally {
+    module.destroy();
+  }
+};
+
 // one request at a time: Porffor's compiler keeps global state, and so may clang
 let queue = Promise.resolve();
 onmessage = ({ data }) => { queue = queue.then(() => handle(data)); };
 
-const handle = async ({ id, code, stages }) => {
+const handle = async ({ id, code, stages, wasm: given }) => {
   const post = (type, more) => postMessage({ id, type, ...more });
   try {
+    if (given) { post('done', { wat: await toWat(given) }); return; }
+
     let t = performance.now();
     const c = await toC(code);
     post('stage', { stage: 'c', ms: performance.now() - t });

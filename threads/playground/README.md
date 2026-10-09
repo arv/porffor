@@ -48,6 +48,9 @@ works too, with `build/` uploaded alongside: `sw.js` supplies the headers it can
 - **The timeline** shows, for each worker, when it ran a thread: workers write the start and
   end times into shared memory, and the page draws them.
 - **The chart** reads lines like `threads 4  290 ms` from the output.
+- **The C and Wasm tabs** show what Porffor generated and what clang made of it, as
+  WebAssembly text (disassembled by [wabt](https://github.com/WebAssembly/wabt)'s wasm2wat,
+  from jsDelivr when the tab first opens), each scrolled to where your code starts.
 
 SharedArrayBuffer needs a cross-origin isolated page. `serve.js` sends the COOP/COEP headers;
 on a static host that cannot (GitHub Pages, say), `sw.js` adds them from a service worker

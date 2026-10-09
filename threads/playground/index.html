@@ -128,11 +128,11 @@
   #chart-legend { font-size: 11.5px; color: var(--muted); }
   #chart-legend i { display: inline-block; width: 2px; height: 10px; background: var(--ideal); opacity: 0.55; vertical-align: -1px; margin-right: 4px; }
 
-  #output, #csource {
+  #output, #csource, #wat {
     flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 12px 16px; background: var(--console); color: var(--console-text);
     font-size: 12.5px; line-height: 1.2; white-space: pre;
   }
-  #csource { color: #c9c2d6; }
+  #csource, #wat { color: #c9c2d6; }
   #output .bg { padding-block: 1px; }
   #output .stderr { color: #ff8a9b; }
   #output .note { color: #8f86a0; font-style: italic; }
@@ -178,6 +178,7 @@
       <div class="tabs" role="tablist">
         <button class="tab" role="tab" id="tab-output" aria-selected="true">Output</button>
         <button class="tab" role="tab" id="tab-c" aria-selected="false">C</button>
+        <button class="tab" role="tab" id="tab-wasm" aria-selected="false">Wasm</button>
       </div>
     </div>
     <div id="run-panel">
@@ -193,6 +194,7 @@
       </div>
       <pre id="output" aria-label="Output"></pre>
       <pre id="csource" aria-label="Generated C" hidden></pre>
+      <pre id="wat" aria-label="WebAssembly text" hidden></pre>
     </div>
   </section>
 </main>
