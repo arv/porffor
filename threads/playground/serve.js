@@ -35,7 +35,11 @@ http.createServer((req, res) => {
   let file = path.join(root, decodeURIComponent(url.pathname));
   if (!file.startsWith(root)) { res.writeHead(403).end(); return; }
   if (url.pathname === '/') { res.writeHead(302, { location: '/threads/playground/' }).end(); return; }
-  if (fs.existsSync(file) && fs.statSync(file).isDirectory()) file = path.join(file, 'index.html');
+  if (fs.existsSync(file) && fs.statSync(file).isDirectory()) {
+    // a directory's page loads its scripts relative to it, so it needs the trailing slash
+    if (!url.pathname.endsWith('/')) { res.writeHead(301, { location: `${url.pathname}/${url.search}` }).end(); return; }
+    file = path.join(file, 'index.html');
+  }
   const headers = {
     'cross-origin-opener-policy': 'same-origin',
     'cross-origin-embedder-policy': 'require-corp',

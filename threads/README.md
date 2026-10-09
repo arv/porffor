@@ -45,7 +45,7 @@ Against `main` (72d048d7), lines added and removed:
 | other compiler files | 64 | 2 |
 | tests (`threads/tests`: 24 programs and their expected output) | 914 | |
 | these notes, the demo, benchmarks and test runner | 340 | |
-| the browser [playground](playground) | 1704 | |
+| the browser [playground](playground) | 1708 | |
 | test262's `$262.agent` host | 134 | 1 |
 
 About 500 of the compiler lines are not about threads: inline caches and other speedups that
