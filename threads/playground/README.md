@@ -15,7 +15,8 @@ node threads/playground/serve.js   # then open http://localhost:8787/threads/pla
   homebrew's `wasi-libc` and `wasi-runtimes` or from wasi-sdk if installed, or else from
   wasi-sdk's release, downloaded once (about 120 MB) into `build/wasi-sdk`.
 - `presets/`: the examples compiled ahead of time, so running one downloads no compiler. This
-  needs a clang that targets wasm (homebrew's `llvm` or wasi-sdk's); without one, the page
+  needs a clang that targets wasm and its `wasm-ld` (homebrew's `llvm` and `lld`, or
+  wasi-sdk); without them, the page
   compiles an example the first time it runs, as it does edited examples and any other code.
 
 `WASI_SYSROOT`, `CLANG_RT` and `WASM_CLANG` point it elsewhere.

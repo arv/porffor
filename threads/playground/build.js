@@ -40,6 +40,10 @@ const fromRelease = async (archive, members) => {
 let sysroot = first(process.env.WASI_SYSROOT, ...brews.map(b => `${b}/share/wasi-sysroot`), '/opt/wasi-sdk/share/wasi-sysroot');
 let clangRt = first(process.env.CLANG_RT, ...brews.map(b => `${b}/opt/wasi-runtimes/share/wasi-runtimes/lib/${rtPath}`), ...wasiSdkRt);
 const clang = first(process.env.WASM_CLANG, ...brews.map(b => `${b}/opt/llvm/bin/clang`), '/opt/wasi-sdk/bin/clang');
+// clang links wasm with wasm-ld, found on PATH or beside clang. homebrew's llvm leaves it out
+// (it is in homebrew's lld)
+const wasmLd = first(...(process.env.PATH ?? '').split(path.delimiter).map(d => d && path.join(d, 'wasm-ld')),
+  clang && path.join(path.dirname(clang), 'wasm-ld'), ...brews.map(b => `${b}/opt/lld/bin/wasm-ld`));
 if (!sysroot || !fs.existsSync(path.join(sysroot, 'lib', 'wasm32-wasip1-threads', 'libc.a'))) {
   sysroot = path.join(cache, 'wasi-sysroot-34.0');
   if (!fs.existsSync(path.join(sysroot, 'lib', 'wasm32-wasip1-threads', 'libc.a')))
@@ -117,8 +121,9 @@ fs.writeFileSync(path.join(out, 'sysroot.tar'), sysrootTar);
 console.log(`build/sysroot.tar: ${headers.size} headers, ${libs.length + 1} libraries, ${(sysrootTar.length / 1024).toFixed(0)} KB`);
 
 // presets, compiled with this tree's compiler and a native clang
-if (!clang) {
-  console.log('no clang that targets wasm (set WASM_CLANG): skipping the presets');
+if (!clang || !wasmLd) {
+  console.log(!clang ? 'no clang that targets wasm (set WASM_CLANG): skipping the presets'
+    : 'no wasm-ld (brew install lld): skipping the presets');
   process.exit(0);
 }
 const presetDir = path.join(here, 'presets');
@@ -132,7 +137,8 @@ try {
     const source = fs.readFileSync(path.join(presetDir, f), 'utf8');
     const c = path.join(tmp, `${name}.c`);
     execFileSync(process.execPath, [ path.join(root, 'runtime', 'index.js'), 'c', path.join(presetDir, f), '-o', c ], { stdio: [ 'ignore', 'ignore', 'inherit' ] });
-    execFileSync(clang, [ ...clangFlags, `--sysroot=${sysroot}`, c, '-o', path.join(builtDir, `${name}.wasm`), ...linkFlags, clangRt ], { stdio: 'inherit' });
+    execFileSync(clang, [ ...clangFlags, `--sysroot=${sysroot}`, c, '-o', path.join(builtDir, `${name}.wasm`), ...linkFlags, clangRt ],
+      { stdio: 'inherit', env: { ...process.env, PATH: `${path.dirname(wasmLd)}${path.delimiter}${process.env.PATH ?? ''}` } });
     manifest[name] = crypto.createHash('sha256').update(source).digest('hex');
     console.log(`build/presets/${name}.wasm`);
   }
