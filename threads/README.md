@@ -27,6 +27,9 @@ console.log(threads.map(t => t.join())); // [ 0, 2, 4, 6 ]
 [demo.js](demo.js) shows more (Maps, `Atomics.wait`/`notify`, `asyncJoin`):
 `node runtime/index.js threads/demo.js`, or `node runtime/index.js native threads/demo.js -o demo`.
 
+[playground](playground) runs threaded programs in the browser, compiled there to
+WebAssembly, with examples that time their work on 1, 2, 4 and 8 threads.
+
 A program that never uses `Thread` compiles none of this in: everything here is only built in
 when it does.
 
@@ -36,12 +39,13 @@ Against `main` (72d048d7), lines added and removed:
 
 | | added | removed |
 |---|---|---|
-| C runtime and emitter (`compiler/render.js`) | 1503 | 150 |
+| C runtime and emitter (`compiler/render.js`) | 1506 | 151 |
 | builtins (`compiler/builtins/*.ts`) | 1123 | 371 |
 | codegen (`compiler/codegen.js`) | 88 | 53 |
 | other compiler files | 64 | 2 |
 | tests (`threads/tests`: 24 programs and their expected output) | 914 | |
-| these notes, the demo, benchmarks and test runner | 336 | |
+| these notes, the demo, benchmarks and test runner | 340 | |
+| the browser [playground](playground) | 1548 | |
 | test262's `$262.agent` host | 134 | 1 |
 
 About 500 of the compiler lines are not about threads: inline caches and other speedups that

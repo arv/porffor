@@ -4934,9 +4934,11 @@ ${prefs.nativeFetch ? '' : st}u8* porf_mem;
 #endif
 #ifdef __wasi__
 // wasi's malloc-backed mmap ignores fixed hints and cannot change protections
-// or decommit, so use a small, fully committed arena
+// or decommit, so use a small, fully committed arena (-DPORF_ARENA_RESERVE=... for another size)
 #define PORF_ARENA_HINT NULL
+#ifndef PORF_ARENA_RESERVE
 #define PORF_ARENA_RESERVE (1ull << 26)
+#endif
 #define PORF_MMAP_RESERVE_PROT (PROT_READ | PROT_WRITE)
 #define PORF_CAN_DECOMMIT 0
 // the emulated mmap rejects flags it does not implement, and NORESERVE is one

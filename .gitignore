@@ -12,3 +12,6 @@ selfhosted/*.c
 # todo: commit some json to git history to help historical/collaborative info
 /test262/*.json
 /test262/.threads
+
+# threads playground build output (node threads/playground/build.js)
+/threads/playground/build

@@ -14,7 +14,8 @@ An ahead-of-time JavaScript compiler
 > inline caches and fixes the branch also picked up. Plus 1.3k of tests and notes. A program
 > that never uses `Thread` compiles none of it in, and single-threaded code in one that does
 > runs a few percent slower. See [threads/README.md](threads/README.md) for the API, how it works, what
-> it costs and how it is tested.
+> it costs and how it is tested, and [threads/playground](threads/playground) to try it in a
+> browser.
 >
 > **Disclaimer:** this was mostly done iterating with the help of Claude Code (Claude Opus 5.5),
 > disclosed per Porffor's [AI policy](AI_POLICY.md).

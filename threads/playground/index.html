@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Porffor Threads Playground</title>
+<meta name="description" content="Shared-memory JavaScript threads, compiled ahead of time by Porffor and run in your browser.">
+<script>
+  // SharedArrayBuffer needs a cross-origin isolated page. hosts that cannot send the
+  // COOP/COEP headers get them from a service worker, after one reload
+  if (!self.crossOriginIsolated && self.isSecureContext && 'serviceWorker' in navigator) {
+    let reloaded = false;
+    try { reloaded = sessionStorage.getItem('coi-reloaded') === '1'; } catch {}
+    if (!reloaded) navigator.serviceWorker.register('sw.js').then(r => {
+      const reload = () => { try { sessionStorage.setItem('coi-reloaded', '1'); } catch {} location.reload(); };
+      if (r.active) reload();
+      else (r.installing ?? r.waiting)?.addEventListener('statechange', e => e.target.state === 'activated' && reload());
+    }).catch(() => {});
+  } else {
+    try { sessionStorage.removeItem('coi-reloaded'); } catch {}
+  }
+</script>
+<style>
+  :root {
+    --bg: #faf9fc; --panel: #ffffff; --panel-2: #f3f0f7; --border: #e3dde9; --text: #1c1625;
+    --muted: #6d6479; --accent: #7a3fd0; --accent-hover: #6a31bd; --accent-soft: #efe6fb;
+    --ok: #13834f; --err: #c3243f; --bar: #9c60e0; --ideal: #1c1625;
+    --console: #15121b; --console-text: #e9e4f1; --lane: #ece7f2; --lane-on: #9c60e0;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f0d13; --panel: #17141d; --panel-2: #1d1925; --border: #2c2636; --text: #ebe6f2;
+      --muted: #9b91aa; --accent: #9c60e0; --accent-hover: #ad78ec; --accent-soft: #2a2138;
+      --ok: #5fd39a; --err: #ff6f86; --bar: #9c60e0; --ideal: #ebe6f2;
+      --console: #0b0a0f; --console-text: #e9e4f1; --lane: #241f2d; --lane-on: #b07ff0;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f0d13; --panel: #17141d; --panel-2: #1d1925; --border: #2c2636; --text: #ebe6f2;
+    --muted: #9b91aa; --accent: #9c60e0; --accent-hover: #ad78ec; --accent-soft: #2a2138;
+    --ok: #5fd39a; --err: #ff6f86; --bar: #9c60e0; --ideal: #ebe6f2;
+    --console: #0b0a0f; --console-text: #e9e4f1; --lane: #241f2d; --lane-on: #b07ff0;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button, select { font: inherit; color: inherit; }
+
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 0 16px; height: 52px; flex: none;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  .brand { display: flex; align-items: baseline; gap: 8px; font-weight: 650; font-size: 17px; letter-spacing: -0.01em; }
+  .brand b { color: var(--accent); font-weight: 750; }
+  .brand span { color: var(--muted); font-weight: 450; font-size: 15px; }
+  header nav { margin-left: auto; display: flex; gap: 16px; font-size: 13.5px; }
+
+  main {
+    flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+  }
+  .pane { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .pane + .pane { border-left: 1px solid var(--border); }
+  .bar {
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px; min-height: 48px; flex: none;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  .bar .grow { flex: 1; }
+
+  select {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 30px 6px 10px; appearance: none; cursor: pointer; max-width: 100%;
+    background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+    background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%; background-size: 5px 5px; background-repeat: no-repeat;
+  }
+  .btn {
+    border: 1px solid var(--border); background: var(--panel-2); border-radius: 8px; padding: 6px 12px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--muted); }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; padding: 6px 16px; }
+  .btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  .btn kbd { font: 11px ui-monospace, monospace; opacity: 0.75; margin-left: 6px; }
+
+  #editor { flex: 1; min-height: 0; overflow: hidden; background: #282c34; }
+  #editor .cm-editor { height: 100%; font-size: 13.5px; }
+  #editor .cm-scroller { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #editor textarea {
+    width: 100%; height: 100%; border: 0; padding: 12px 16px; resize: none; outline: none;
+    background: #282c34; color: #abb2bf; font: 13.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; tab-size: 2;
+  }
+
+  #status { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; font-size: 12.5px; color: var(--muted); }
+  .chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); white-space: nowrap; }
+  .chip.ok { color: var(--ok); }
+  .chip.err { color: var(--err); }
+  .chip.busy::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.25; } }
+
+  .tabs { display: flex; gap: 2px; }
+  .tab { border: 0; background: none; padding: 6px 10px; border-radius: 6px; cursor: pointer; color: var(--muted); }
+  .tab[aria-selected="true"] { background: var(--accent-soft); color: var(--text); font-weight: 600; }
+
+  #run-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  #viz { flex: none; padding: 12px 16px 4px; display: grid; gap: 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  #viz[hidden] { display: none; }
+  .viz-title { font-size: 11.5px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 6px; display: flex; gap: 8px; }
+  .viz-title span { font-weight: 450; text-transform: none; letter-spacing: 0; }
+  #lanes { width: 100%; height: 0; display: block; border-radius: 6px; }
+  #chart { display: grid; grid-template-columns: auto 1fr auto; gap: 5px 10px; align-items: center; font-size: 12.5px; }
+  #chart .label { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #chart .track { position: relative; height: 16px; background: var(--lane); border-radius: 4px; overflow: hidden; }
+  #chart .fill { position: absolute; inset: 0 auto 0 0; background: var(--bar); border-radius: 4px; transition: width 0.3s ease; }
+  #chart .ideal { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--ideal); opacity: 0.55; }
+  #chart .value { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #chart .value b { color: var(--accent); }
+  #chart-legend { font-size: 11.5px; color: var(--muted); }
+  #chart-legend i { display: inline-block; width: 2px; height: 10px; background: var(--ideal); opacity: 0.55; vertical-align: -1px; margin-right: 4px; }
+
+  #output, #csource {
+    flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 12px 16px; background: var(--console); color: var(--console-text);
+    font-size: 12.5px; line-height: 1.2; white-space: pre;
+  }
+  #csource { color: #c9c2d6; }
+  #output .bg { padding-block: 1px; }
+  #output .stderr { color: #ff8a9b; }
+  #output .note { color: #8f86a0; font-style: italic; }
+  #output .exit { color: #8f86a0; }
+  #output:empty::before { white-space: normal; display: block; max-width: 46ch; content: "Pick an example or write your own, then press Run (" attr(data-key) "). The first run that needs compiling downloads clang, about 25 MB, once."; color: #8f86a0; }
+  [hidden] { display: none !important; }
+
+  footer { flex: none; padding: 6px 16px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); background: var(--panel); display: flex; gap: 16px; flex-wrap: wrap; }
+  footer .warn { color: var(--err); }
+
+  @media (max-width: 860px) {
+    main { grid-template-columns: 1fr; grid-template-rows: minmax(320px, 50vh) auto; overflow: auto; }
+    .pane + .pane { border-left: 0; border-top: 1px solid var(--border); }
+    #run-panel { min-height: 60vh; }
+    header nav a.optional { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><b>Porffor</b> threads <span>playground</span></div>
+  <nav>
+    <a class="optional" href="https://github.com/arv/porffor/blob/arv/shared-everything-threads/threads/README.md" target="_blank" rel="noopener">How threads work</a>
+    <a href="https://github.com/arv/porffor/tree/arv/shared-everything-threads" target="_blank" rel="noopener">Source</a>
+  </nav>
+</header>
+
+<main>
+  <section class="pane" aria-label="Code">
+    <div class="bar">
+      <select id="preset" aria-label="Example"></select>
+      <div class="grow"></div>
+      <button class="btn" id="share" title="Copy a link to this code">Share</button>
+    </div>
+    <div id="editor"></div>
+  </section>
+
+  <section class="pane" aria-label="Run">
+    <div class="bar">
+      <button class="btn primary" id="run">Run<kbd id="run-key"></kbd></button>
+      <button class="btn" id="stop" hidden>Stop</button>
+      <div id="status" class="grow" role="status" aria-live="polite"></div>
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" id="tab-output" aria-selected="true">Output</button>
+        <button class="tab" role="tab" id="tab-c" aria-selected="false">C</button>
+      </div>
+    </div>
+    <div id="run-panel">
+      <div id="viz" hidden>
+        <div id="lanes-box">
+          <div class="viz-title">Threads <span id="lanes-note"></span></div>
+          <canvas id="lanes"></canvas>
+        </div>
+        <div id="chart-box" hidden>
+          <div class="viz-title">Time by thread count <span id="chart-legend"><i></i>perfect scaling</span></div>
+          <div id="chart"></div>
+        </div>
+      </div>
+      <pre id="output" aria-label="Output"></pre>
+      <pre id="csource" aria-label="Generated C" hidden></pre>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>Your JS is compiled to C by Porffor, then to WebAssembly by clang, all in this page. Each thread is a Web Worker on one shared memory.</span>
+  <span id="env"></span>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
