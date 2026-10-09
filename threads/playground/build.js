@@ -2,13 +2,16 @@
 //   build/sysroot.tar   the parts of a wasm32-wasip1-threads sysroot that Porffor's C needs
 //                       (libc headers and libraries, compiler-rt builtins), for clang in the page
 //   build/presets/      each preset compiled ahead of time, so running one needs no clang download
-// WASI_SYSROOT, CLANG_RT and WASM_CLANG override where the sysroot, the threads builtins
-// library and a clang that targets wasm are found (homebrew's wasi-libc, wasi-runtimes and llvm
-// by default)
+// the sysroot and builtins come from homebrew's wasi-libc and wasi-runtimes or from wasi-sdk
+// if installed, or else from wasi-sdk's release (downloaded once, into build/wasi-sdk). the
+// presets need a clang that targets wasm (homebrew's llvm or wasi-sdk's); without one, the page
+// compiles them the first time they run. WASI_SYSROOT, CLANG_RT and WASM_CLANG override all this
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -16,14 +19,35 @@ const root = path.resolve(here, '../..');
 const out = path.join(here, 'build');
 
 const first = (...xs) => xs.find(x => x && fs.existsSync(x));
-const sysroot = first(process.env.WASI_SYSROOT, '/opt/homebrew/share/wasi-sysroot', '/opt/wasi-sdk/share/wasi-sysroot');
-const clangRt = first(process.env.CLANG_RT,
-  '/opt/homebrew/opt/wasi-runtimes/share/wasi-runtimes/lib/wasm32-unknown-wasip1-threads/libclang_rt.builtins.a',
-  ...(fs.existsSync('/opt/wasi-sdk/lib/clang') ? fs.readdirSync('/opt/wasi-sdk/lib/clang').map(v => `/opt/wasi-sdk/lib/clang/${v}/lib/wasm32-unknown-wasip1-threads/libclang_rt.builtins.a`) : []));
-const clang = first(process.env.WASM_CLANG, '/opt/homebrew/opt/llvm/bin/clang', '/opt/wasi-sdk/bin/clang');
-if (!sysroot || !clangRt) {
-  console.error('need a wasm32-wasip1-threads sysroot and compiler-rt builtins: set WASI_SYSROOT and CLANG_RT');
-  process.exit(1);
+const brews = [ '/opt/homebrew', '/usr/local', '/home/linuxbrew/.linuxbrew' ];
+const wasiSdkRt = fs.existsSync('/opt/wasi-sdk/lib/clang') ? fs.readdirSync('/opt/wasi-sdk/lib/clang').map(v => `/opt/wasi-sdk/lib/clang/${v}/lib/wasm32-unknown-wasip1-threads/libclang_rt.builtins.a`) : [];
+const rtPath = 'wasm32-unknown-wasip1-threads/libclang_rt.builtins.a';
+
+// a wasi-sdk release archive, downloaded into build/wasi-sdk and unpacked there (just members)
+const RELEASE = 'https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34';
+const cache = path.join(out, 'wasi-sdk');
+const fromRelease = async (archive, members) => {
+  fs.mkdirSync(cache, { recursive: true });
+  const file = path.join(cache, archive);
+  console.log(`downloading ${archive} from ${RELEASE}`);
+  const res = await fetch(`${RELEASE}/${archive}`);
+  if (!res.ok) throw new Error(`${archive}: HTTP ${res.status}`);
+  await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(file));
+  execFileSync('tar', [ 'xzf', file, '-C', cache, ...members ]);
+  fs.rmSync(file);
+};
+
+let sysroot = first(process.env.WASI_SYSROOT, ...brews.map(b => `${b}/share/wasi-sysroot`), '/opt/wasi-sdk/share/wasi-sysroot');
+let clangRt = first(process.env.CLANG_RT, ...brews.map(b => `${b}/opt/wasi-runtimes/share/wasi-runtimes/lib/${rtPath}`), ...wasiSdkRt);
+const clang = first(process.env.WASM_CLANG, ...brews.map(b => `${b}/opt/llvm/bin/clang`), '/opt/wasi-sdk/bin/clang');
+if (!sysroot || !fs.existsSync(path.join(sysroot, 'lib', 'wasm32-wasip1-threads', 'libc.a'))) {
+  sysroot = path.join(cache, 'wasi-sysroot-34.0');
+  if (!fs.existsSync(path.join(sysroot, 'lib', 'wasm32-wasip1-threads', 'libc.a')))
+    await fromRelease('wasi-sysroot-34.0.tar.gz', [ 'wasi-sysroot-34.0/include/wasm32-wasip1-threads', 'wasi-sysroot-34.0/lib/wasm32-wasip1-threads' ]);
+}
+if (!clangRt) {
+  clangRt = path.join(cache, 'libclang_rt-34.0', rtPath);
+  if (!fs.existsSync(clangRt)) await fromRelease('libclang_rt-34.0.tar.gz', [ `libclang_rt-34.0/${rtPath}` ]);
 }
 
 // the flags clang gets in the page too (keep compiler.worker.js in step)

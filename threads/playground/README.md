@@ -9,13 +9,16 @@ node threads/playground/build.js   # once, and after changing the compiler or a 
 node threads/playground/serve.js   # then open http://localhost:8787/threads/playground/
 ```
 
-`build.js` needs a wasm32-wasip1-threads sysroot and its compiler-rt builtins (homebrew's
-`wasi-libc` and `wasi-runtimes`, or wasi-sdk; `WASI_SYSROOT` and `CLANG_RT` point elsewhere),
-and a clang that targets wasm for the presets (`WASM_CLANG`). It writes `build/`:
-- `sysroot.tar`: the libc headers Porffor's C includes, libc and the builtins, about 1.3 MB.
-  clang in the page compiles against it.
-- `presets/`: the examples compiled ahead of time, so running one downloads no compiler. An
-  edited example, or any other code, is compiled in the page.
+`build.js` writes `build/`:
+- `sysroot.tar`: the libc headers Porffor's C includes, libc and the compiler-rt builtins
+  for wasm32-wasip1-threads, 1.3-4 MB. clang in the page compiles against it. They come from
+  homebrew's `wasi-libc` and `wasi-runtimes` or from wasi-sdk if installed, or else from
+  wasi-sdk's release, downloaded once (about 120 MB) into `build/wasi-sdk`.
+- `presets/`: the examples compiled ahead of time, so running one downloads no compiler. This
+  needs a clang that targets wasm (homebrew's `llvm` or wasi-sdk's); without one, the page
+  compiles an example the first time it runs, as it does edited examples and any other code.
+
+`WASI_SYSROOT`, `CLANG_RT` and `WASM_CLANG` point it elsewhere.
 
 ## How it works
 
